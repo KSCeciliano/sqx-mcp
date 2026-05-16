@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "strategyquant": {
+      "command": "uvx",
+      "args": ["sq-mcp@latest"],
+      "env": {
+        "SQX_HTTP_URL": "http://localhost:5050"
+      }
+    }
+  }
+}

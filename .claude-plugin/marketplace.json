@@ -1,0 +1,15 @@
+{
+  "name": "sq-mcp",
+  "owner": {
+    "name": "sq-mcp contributors"
+  },
+  "plugins": [
+    {
+      "name": "sq-mcp",
+      "source": ".",
+      "description": "StrategyQuant X plugin for Claude Code — drive backtests, monitor builds, audit strategies.",
+      "version": "0.1.0",
+      "category": "trading"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sq-mcp"
+version = "0.1.0"
+description = "MCP server + Claude Code plugin for native interaction with StrategyQuant X. Drive backtests, monitor builds in real time, audit strategies, and orchestrate portfolios from any MCP client."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "sq-mcp contributors" }]
+keywords = ["mcp", "strategyquant", "trading", "algotrading", "claude", "backtesting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "mcp[cli]>=1.13.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.7.0",
+    "lxml>=5.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+sq-mcp = "sq_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/sq-mcp/sq-mcp"
+Issues = "https://github.com/sq-mcp/sq-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sq_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

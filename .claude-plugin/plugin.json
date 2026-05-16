@@ -1,0 +1,19 @@
+{
+  "name": "sq-mcp",
+  "version": "0.1.0",
+  "description": "Native StrategyQuant X integration for Claude Code: backtest, monitor builds in real time, audit MQL5/.sqx files, and orchestrate portfolios — all from natural language.",
+  "author": {
+    "name": "sq-mcp contributors"
+  },
+  "homepage": "https://github.com/sq-mcp/sq-mcp",
+  "repository": "https://github.com/sq-mcp/sq-mcp",
+  "license": "MIT",
+  "keywords": [
+    "strategyquant",
+    "trading",
+    "algotrading",
+    "backtesting",
+    "metatrader",
+    "mql5"
+  ]
+}
