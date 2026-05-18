@@ -17,6 +17,8 @@ from pathlib import Path
 
 from lxml import etree
 
+from sq_mcp._xml import safe_fromstring
+
 
 @dataclass
 class CfxTask:
@@ -64,7 +66,7 @@ def parse_cfx(path: str | Path) -> CfxFile:
             raise ValueError(f"{p} is missing config.xml")
         cfg_bytes = z.read("config.xml")
         try:
-            cfg = etree.fromstring(cfg_bytes)
+            cfg = safe_fromstring(cfg_bytes)
         except etree.XMLSyntaxError as exc:
             raise ValueError(f"config.xml in {p} is not valid XML: {exc}") from exc
 

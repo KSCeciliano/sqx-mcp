@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from sq_mcp._validation import ValidationError, resolve_safe_path
 from sq_mcp.parsers import analyze_mq5, parse_cfx
+from sq_mcp.parsers.sqx import derive_metrics, parse_sqx
 from sq_mcp.tools._common import safe_error_payload
 
 
@@ -25,6 +26,23 @@ class CompareMq5Args(BaseModel):
 
 class CfxPathArgs(BaseModel):
     path: str = Field(..., description="Absolute path to a .cfx (project config) file.")
+
+
+class SqxMetricsArgs(BaseModel):
+    path: str = Field(..., description="Path to a .sqx file.")
+
+
+class SqxExplainArgs(BaseModel):
+    path: str = Field(..., description="Path to a .sqx file.")
+    include_optimization_params: bool = Field(
+        True, description="Include the optimized parameters table in the explanation."
+    )
+
+
+class SqxCompareArgs(BaseModel):
+    paths: list[str] = Field(
+        ..., min_length=2, max_length=50, description="Two or more (max 50) .sqx paths to compare."
+    )
 
 
 def register(mcp: FastMCP) -> None:
@@ -108,3 +126,197 @@ def register(mcp: FastMCP) -> None:
             return {"ok": True, **parse_cfx(path).as_dict()}
         except (ValidationError, ValueError, FileNotFoundError, OSError) as exc:
             return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Full performance metrics for a single .sqx strategy file: fitness IS/OOS, "
+            "trades, net profit, drawdown, derived ratios (return %, DD %, profit-to-DD, "
+            "avg trade, trades/year, OOS/IS ratio), backtest window, symbol/timeframe, "
+            "instrument metadata, and the optimization parameter map. Pure file read — "
+            "no engine call. Use this to rank, filter, or audit strategies straight from "
+            "a databank folder."
+        )
+    )
+    async def strategy_metrics(args: SqxMetricsArgs, ctx: Context) -> dict:
+        try:
+            path = resolve_safe_path(args.path, must_exist=True)
+            info = parse_sqx(path)
+            return {
+                "ok": True,
+                "path": str(path),
+                "metrics": derive_metrics(info),
+                "fingerprint": info.fingerprint.as_dict() if info.fingerprint else None,
+                "symbol_info": info.symbol_info.as_dict() if info.symbol_info else None,
+                "optimization_parameters": (
+                    info.meta.optimization_parameters if info.meta else {}
+                ),
+                "equity_curve_points": (
+                    len(info.meta.equity_curve_full) if info.meta else 0
+                ),
+                "has_orders_bin": info.has_orders_bin,
+                "has_equity_bins": info.has_equity_bins,
+            }
+        except (ValidationError, ValueError, FileNotFoundError, OSError) as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Generate a human-readable explanation of a strategy: name, symbol/timeframe, "
+            "backtest window, money management, trade outcome, risk warnings, and the "
+            "optimized parameter table. Useful for surfacing a one-paragraph summary that "
+            "you (the agent) can present to a human or use as a quick eyeball check before "
+            "deciding to retest / deploy."
+        )
+    )
+    async def strategy_explain(args: SqxExplainArgs, ctx: Context) -> dict:
+        try:
+            path = resolve_safe_path(args.path, must_exist=True)
+            info = parse_sqx(path)
+            m = derive_metrics(info)
+            lines = _explain_lines(info, m, include_params=args.include_optimization_params)
+            return {
+                "ok": True,
+                "path": str(path),
+                "summary": " ".join(lines),
+                "lines": lines,
+                "metrics": m,
+            }
+        except (ValidationError, ValueError, FileNotFoundError, OSError) as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Compare two or more .sqx files side-by-side. Returns a metrics table sorted "
+            "by profit_to_dd_ratio (defensive ranking that penalizes large drawdowns), "
+            "plus warnings: duplicate trades_hash (same exact backtest), wildly different "
+            "trade counts, OOS degradation. Use before promoting strategies to live."
+        )
+    )
+    async def strategy_compare(args: SqxCompareArgs, ctx: Context) -> dict:
+        try:
+            rows: list[dict] = []
+            hash_groups: dict[str, list[str]] = {}
+            for p in args.paths:
+                path = resolve_safe_path(p, must_exist=True)
+                info = parse_sqx(path)
+                m = derive_metrics(info)
+                rows.append({"path": str(path), **m})
+                h = m.get("trades_hash")
+                if h:
+                    hash_groups.setdefault(h, []).append(str(path))
+
+            duplicates = {h: paths for h, paths in hash_groups.items() if len(paths) > 1}
+
+            def _key(r: dict) -> float:
+                v = r.get("profit_to_dd_ratio")
+                # Push None to the bottom of a descending sort
+                return v if isinstance(v, (int, float)) else float("-inf")
+
+            sorted_rows = sorted(rows, key=_key, reverse=True)
+
+            warnings: list[str] = []
+            if duplicates:
+                warnings.append(
+                    f"{len(duplicates)} pair(s) of strategies share an identical trades_hash"
+                )
+            counts = [r.get("trades") or 0 for r in rows]
+            if counts and max(counts) > 0:
+                ratio = (min(counts) + 1) / (max(counts) + 1)
+                if ratio < 0.25:
+                    warnings.append(
+                        f"trade counts span {min(counts)} – {max(counts)} (>4× range)"
+                    )
+            overfit = [r for r in rows if (r.get("oos_is_ratio") or 1.0) < 0.5]
+            if overfit:
+                warnings.append(
+                    f"{len(overfit)} strateg(ies) have OOS/IS fitness ratio < 0.5 — "
+                    "possible overfit"
+                )
+
+            return {
+                "ok": True,
+                "ranked": sorted_rows,
+                "duplicates": duplicates,
+                "warnings": warnings,
+                "count": len(rows),
+            }
+        except (ValidationError, ValueError, FileNotFoundError, OSError) as exc:
+            return safe_error_payload(exc)
+
+
+# ---- explanation helper -----------------------------------------------------
+
+
+def _explain_lines(info, m: dict, *, include_params: bool) -> list[str]:
+    """Compose the human-readable bullets for strategy_explain."""
+    lines: list[str] = []
+    name = m.get("strategy_name") or info.path.stem
+    sym = m.get("symbol") or "(unknown symbol)"
+    tf = m.get("timeframe") or "(unknown TF)"
+    lines.append(f"{name} on {sym} {tf}.")
+
+    if m.get("history_from_iso") and m.get("history_to_iso"):
+        years = m.get("history_years")
+        years_txt = f" (~{years:.1f}y)" if isinstance(years, (int, float)) else ""
+        lines.append(
+            f"Backtest window {m['history_from_iso']} → {m['history_to_iso']}{years_txt}."
+        )
+
+    trades = m.get("trades")
+    profit = m.get("net_profit")
+    dd = m.get("drawdown_abs")
+    cap = m.get("initial_capital")
+    if trades is not None and profit is not None and dd is not None:
+        pieces = [f"{trades} trades, net P/L {profit:+,.2f}"]
+        if cap and cap > 0:
+            pieces[-1] += f" ({m.get('return_pct')}% on {cap:,.0f} capital)"
+        pieces.append(
+            f"max DD {dd:,.2f}"
+            + (f" ({m.get('drawdown_pct')}%)" if m.get("drawdown_pct") is not None else "")
+        )
+        if m.get("profit_to_dd_ratio") is not None:
+            pieces.append(f"profit-to-DD {m['profit_to_dd_ratio']}")
+        if m.get("avg_trade") is not None:
+            pieces.append(f"avg trade {m['avg_trade']:+.2f}")
+        if m.get("trades_per_year") is not None:
+            pieces.append(f"{m['trades_per_year']} trades/year")
+        lines.append(", ".join(pieces) + ".")
+
+    if m.get("fitness_is") is not None or m.get("fitness_oos") is not None:
+        is_v = m.get("fitness_is")
+        oos_v = m.get("fitness_oos")
+        ratio = m.get("oos_is_ratio")
+        if is_v is not None and oos_v is not None:
+            lines.append(
+                f"Fitness IS={is_v:.4f} OOS={oos_v:.4f}"
+                + (f" (OOS/IS={ratio:.2f})" if ratio is not None else "")
+                + "."
+            )
+        elif is_v is not None:
+            lines.append(f"Fitness IS={is_v:.4f} (no OOS available).")
+
+    if m.get("ambiguous_trades"):
+        lines.append(
+            f"⚠ {m['ambiguous_trades']} ambiguous trades reported by the engine."
+        )
+    if m.get("strategy_problems"):
+        lines.append(
+            f"⚠ engine flagged {m['strategy_problems']} strategy problem(s)."
+        )
+
+    if include_params and info.meta and info.meta.optimization_parameters:
+        param_strs = [f"{k}={v}" for k, v in info.meta.optimization_parameters.items()]
+        lines.append("Parameters: " + ", ".join(param_strs) + ".")
+
+    si = info.symbol_info
+    if si and si.point_value:
+        bits = [f"point value {si.point_value}"]
+        if si.tick_size is not None:
+            bits.append(f"tick size {si.tick_size}")
+        if si.default_spread is not None:
+            bits.append(f"default spread {si.default_spread}")
+        if si.broker_id is not None:
+            bits.append(f"broker_id {si.broker_id}")
+        lines.append("Instrument: " + ", ".join(bits) + ".")
+
+    return lines

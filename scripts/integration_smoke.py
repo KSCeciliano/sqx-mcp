@@ -49,8 +49,11 @@ async def main() -> int:
         return 1
 
     # --- offline parsers (no engine needed) ----------------------------------
-    _h("offline analysis: polymarket .mq5")
-    poly = Path("/home/davserver/Downloads/polymarketfinalistasStrategy 1.2.17436.mq5")
+    _h("offline analysis: sample .mq5")
+    # Override via SMOKE_MQ5_PATH env var to point at a real .mq5 to audit.
+    import os
+    sample_path = os.environ.get("SMOKE_MQ5_PATH")
+    poly = Path(sample_path) if sample_path else Path.home() / "sample.mq5"
     if poly.exists():
         s = analyze_mq5(poly)
         _kv("strategy", s.name)

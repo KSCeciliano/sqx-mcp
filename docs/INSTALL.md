@@ -48,8 +48,8 @@ Restart the client. Tools should appear under `mcp__strategyquant__*`.
 ## Path 3 — From source (development)
 
 ```bash
-git clone https://github.com/sq-mcp/sq-mcp ~/Apps/sq-mcp
-cd ~/Apps/sq-mcp
+git clone https://github.com/DAVIDAROCA27/sqx-mcp ~/Apps/sqx-mcp
+cd ~/Apps/sqx-mcp
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ```

@@ -16,7 +16,114 @@ from mcp.server.fastmcp import FastMCP
 
 from sq_mcp.config import detect_config
 from sq_mcp.engine import EngineClient
-from sq_mcp.tools import analysis, data, databanks, projects, symbols
+from sq_mcp.tools import (
+    advisor,
+    alerts,
+    analysis,
+    analytics,
+    annual_report,
+    audit,
+    backup,
+    bar_construction,
+    bar_resampler,
+    batch,
+    batch_audit,
+    benchmark,
+    brittle,
+    calendar_effects,
+    cfx_advanced,
+    cfx_config,
+    cfx_diff,
+    cfx_lint,
+    cfx_templates,
+    clustering,
+    cointegration,
+    comparison,
+    cost_model,
+    cpcv,
+    cross_instrument,
+    crypto_perp,
+    dashboard,
+    data,
+    data_health,
+    data_quality,
+    databank_partition,
+    databanks,
+    diagnostics,
+    drawdown_analysis,
+    drift,
+    engine_watchdog,
+    explain,
+    exposure,
+    fingerprint,
+    frac_diff,
+    hypothesis,
+    indicator_bands,
+    info_theory,
+    integrity,
+    labeling,
+    lineage,
+    mean_reversion,
+    meta,
+    montecarlo,
+    mt5,
+    mt5_ea_template,
+    mt5_extra,
+    mt5_reports,
+    mt5_set_files,
+    notify,
+    oscillators,
+    overfit_diag,
+    passthrough,
+    performance_attribution,
+    pinescript_gen,
+    pipeline,
+    pipeline_mt5,
+    pivots,
+    portfolio,
+    portfolio_audit,
+    portfolio_opt,
+    portfolio_risk,
+    position_sizing,
+    presets,
+    projects,
+    promotion,
+    prompt_safety,
+    ratios,
+    regime,
+    regression,
+    reports,
+    risk_profiles,
+    robustness,
+    rolling_metrics,
+    schedule,
+    sensitivity,
+    ship_pipeline,
+    signal_quality,
+    spa_test,
+    sqx_lifecycle,
+    state,
+    stationary_bootstrap,
+    stats_extra,
+    strategy_inspect,
+    stress_test,
+    symbol_intel,
+    symbols,
+    system_perm,
+    tagging,
+    tail_risk,
+    trade_analysis,
+    trade_replay,
+    visualize,
+    vol_estimators,
+    vwap,
+    walkforward,
+    wf_matrix,
+    workflows,
+    workspace_doctor,
+    workspace_ops,
+    workspace_search,
+)
 from sq_mcp.tools import monitor as monitor_tools
 from sq_mcp.tools.monitor import _MANAGER  # noqa: F401  (referenced for shutdown)
 
@@ -75,6 +182,107 @@ data.register(mcp)
 symbols.register(mcp)
 analysis.register(mcp)
 monitor_tools.register(mcp)
+robustness.register(mcp)
+mt5.register(mcp)
+diagnostics.register(mcp)
+audit.register(mcp)
+portfolio.register(mcp)
+cfx_config.register(mcp)
+regression.register(mcp)
+comparison.register(mcp)
+pipeline.register(mcp)
+integrity.register(mcp)
+cfx_advanced.register(mcp)
+mt5_extra.register(mcp)
+strategy_inspect.register(mcp)
+portfolio_risk.register(mcp)
+batch.register(mcp)
+data_quality.register(mcp)
+meta.register(mcp)
+analytics.register(mcp)
+pipeline_mt5.register(mcp)
+backup.register(mcp)
+reports.register(mcp)
+cfx_diff.register(mcp)
+visualize.register(mcp)
+cfx_lint.register(mcp)
+trade_analysis.register(mcp)
+presets.register(mcp)
+state.register(mcp)
+portfolio_audit.register(mcp)
+cfx_templates.register(mcp)
+databank_partition.register(mcp)
+advisor.register(mcp)
+mt5_reports.register(mcp)
+passthrough.register(mcp)
+engine_watchdog.register(mcp)
+workspace_doctor.register(mcp)
+workspace_search.register(mcp)
+sqx_lifecycle.register(mcp)
+explain.register(mcp)
+position_sizing.register(mcp)
+montecarlo.register(mcp)
+clustering.register(mcp)
+walkforward.register(mcp)
+symbol_intel.register(mcp)
+notify.register(mcp)
+risk_profiles.register(mcp)
+mt5_ea_template.register(mcp)
+performance_attribution.register(mcp)
+tagging.register(mcp)
+drift.register(mcp)
+brittle.register(mcp)
+cost_model.register(mcp)
+schedule.register(mcp)
+annual_report.register(mcp)
+ratios.register(mcp)
+calendar_effects.register(mcp)
+lineage.register(mcp)
+sensitivity.register(mcp)
+alerts.register(mcp)
+stress_test.register(mcp)
+promotion.register(mcp)
+benchmark.register(mcp)
+hypothesis.register(mcp)
+ship_pipeline.register(mcp)
+cross_instrument.register(mcp)
+batch_audit.register(mcp)
+dashboard.register(mcp)
+workflows.register(mcp)
+tail_risk.register(mcp)
+overfit_diag.register(mcp)
+regime.register(mcp)
+stats_extra.register(mcp)
+fingerprint.register(mcp)
+data_health.register(mcp)
+portfolio_opt.register(mcp)
+trade_replay.register(mcp)
+workspace_ops.register(mcp)
+pinescript_gen.register(mcp)
+mt5_set_files.register(mcp)
+labeling.register(mcp)
+frac_diff.register(mcp)
+cpcv.register(mcp)
+crypto_perp.register(mcp)
+stationary_bootstrap.register(mcp)
+wf_matrix.register(mcp)
+spa_test.register(mcp)
+system_perm.register(mcp)
+vol_estimators.register(mcp)
+bar_construction.register(mcp)
+mean_reversion.register(mcp)
+info_theory.register(mcp)
+pivots.register(mcp)
+vwap.register(mcp)
+prompt_safety.register(mcp)
+bar_resampler.register(mcp)
+rolling_metrics.register(mcp)
+drawdown_analysis.register(mcp)
+cointegration.register(mcp)
+exposure.register(mcp)
+signal_quality.register(mcp)
+indicator_bands.register(mcp)
+oscillators.register(mcp)
 
 
 def main() -> None:

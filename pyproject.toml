@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sq-mcp"
-version = "0.1.0"
+version = "0.4.9"
 description = "MCP server + Claude Code plugin for native interaction with StrategyQuant X. Drive backtests, monitor builds in real time, audit strategies, and orchestrate portfolios from any MCP client."
 readme = "README.md"
 license = { text = "MIT" }
@@ -38,8 +38,8 @@ dev = [
 sq-mcp = "sq_mcp.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/sq-mcp/sq-mcp"
-Issues = "https://github.com/sq-mcp/sq-mcp/issues"
+Homepage = "https://github.com/DAVIDAROCA27/sqx-mcp"
+Issues = "https://github.com/DAVIDAROCA27/sqx-mcp/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sq_mcp"]
@@ -55,3 +55,21 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = [
+    "sq_mcp.tools._numerics",
+    "sq_mcp.tools.ratios",
+    "sq_mcp.tools.tail_risk",
+    "sq_mcp.tools.stats_extra",
+    "sq_mcp.tools.overfit_diag",
+]
+disallow_untyped_defs = true

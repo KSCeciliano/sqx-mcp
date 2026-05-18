@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
 import shutil
 import time
@@ -25,6 +26,7 @@ from sq_mcp._validation import (
     validate_symbol,
     validate_timeframe,
 )
+from sq_mcp._xml import safe_fromstring
 from sq_mcp.engine import EngineClient, EngineError
 from sq_mcp.parsers import parse_cfx
 from sq_mcp.tools._common import (
@@ -36,6 +38,18 @@ from sq_mcp.tools._common import (
 )
 
 # ---- filesystem helpers (used by fallbacks and clone/registry) -------------
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write data to path atomically: tmp file + os.replace.
+
+    Guarantees the destination is never left in a half-written state if the
+    process is killed mid-write. Critical for CFX archives that SQ X reads
+    on the next project load.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
 
 
 def _scan_projects_fs(projects_dir: Path) -> list[dict[str, Any]]:
@@ -148,7 +162,7 @@ def _quote_if_space(value: str) -> str:
 
 
 def _patch_config_xml(xml_bytes: bytes, new_name: str) -> bytes:
-    root = etree.fromstring(xml_bytes)
+    root = safe_fromstring(xml_bytes)
     root.set("name", new_name)
     return etree.tostring(root, encoding="UTF-8", xml_declaration=True, standalone=True)
 
@@ -166,7 +180,7 @@ def _patch_task_xml(
     date_to: str | None,
 ) -> tuple[bytes, Counter]:
     """Rewrite symbol / timeframe / dateFrom / dateTo attributes throughout a task XML."""
-    root = etree.fromstring(xml_bytes)
+    root = safe_fromstring(xml_bytes)
     changes: Counter = Counter()
 
     df_epoch = _date_to_epoch_ms(date_from) if date_from else None
@@ -237,7 +251,7 @@ def _clone_cfx_zip(
                     per_file[item.filename] = dict(c)
                     total_changes.update(c)
             dst.writestr(item, raw)
-    dst_cfx.write_bytes(buf.getvalue())
+    _atomic_write_bytes(dst_cfx, buf.getvalue())
     return {"total_changes": dict(total_changes), "per_file": per_file}
 
 
@@ -263,7 +277,7 @@ def _extract_broker_entries(cfx_path: Path, project_name: str) -> list[dict[str,
                 if not _is_task_xml(name):
                     continue
                 try:
-                    root = etree.fromstring(z.read(name))
+                    root = safe_fromstring(z.read(name))
                 except etree.XMLSyntaxError:
                     continue
                 for el in root.iter():
@@ -339,7 +353,7 @@ def _validate_cfx_structure(cfx_path: Path) -> dict[str, Any]:
                 "files_in_archive": sorted(names),
             }
         try:
-            cfg = etree.fromstring(z.read("config.xml"))
+            cfg = safe_fromstring(z.read("config.xml"))
         except etree.XMLSyntaxError as exc:
             return {"ok": False, "error": f"config.xml is not valid XML: {exc}"}
         project_name = cfg.get("name")
@@ -372,7 +386,7 @@ def _validate_cfx_structure(cfx_path: Path) -> dict[str, Any]:
             if not entry["exists"]:
                 continue
             try:
-                etree.fromstring(z.read(entry["xml_file"]))
+                safe_fromstring(z.read(entry["xml_file"]))
             except etree.XMLSyntaxError as exc:
                 err = {"file": entry["xml_file"], "error": str(exc)}
                 xml_parse_errors.append(err)
@@ -620,7 +634,7 @@ def _referenced_symbols_from_cfx(cfx_path: Path) -> set[str]:
                 if not _is_task_xml(name):
                     continue
                 try:
-                    root = etree.fromstring(z.read(name))
+                    root = safe_fromstring(z.read(name))
                 except etree.XMLSyntaxError:
                     continue
                 for el in root.iter():
@@ -645,7 +659,7 @@ def _referenced_dates_from_cfx(cfx_path: Path) -> dict[str, list[str]]:
                 if not _is_task_xml(name):
                     continue
                 try:
-                    root = etree.fromstring(z.read(name))
+                    root = safe_fromstring(z.read(name))
                 except etree.XMLSyntaxError:
                     continue
                 for el in root.iter():
@@ -1043,6 +1057,352 @@ class ProjectLoadAndStartArgs(BaseModel):
 class ProjectForceRemoveArgs(BaseModel):
     project: str = Field(..., description="Project name to remove from BOTH engine internal state AND filesystem.")
     delete_directory: bool = Field(True, description="If True, rm -rf the project directory after engine removal.")
+
+
+class EngineHelpArgs(BaseModel):
+    command: str | None = Field(
+        None,
+        description=(
+            "sqcli command to query (e.g. 'project', 'databank', 'tools'). Omit to "
+            "get the top-level help (list of all commands)."
+        ),
+    )
+
+    @field_validator("command")
+    @classmethod
+    def _v_command(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if len(v) > 64:
+            raise ValueError("command too long")
+        if not v.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("command must be alphanumeric (with - and _ allowed)")
+        return v
+
+
+class ProjectWaitForCompletionArgs(BaseModel):
+    project: str = Field(..., description="Project name to wait on.")
+    databank: str = Field(
+        "Results",
+        description="Databank to poll for stalled growth (typically 'Results' for Builders/Retesters).",
+    )
+    max_wait_seconds: float = Field(
+        3600.0,
+        ge=10.0,
+        le=86_400.0,
+        description=(
+            "Hard ceiling on the wait (10s..24h). 1h default fits most Retesters; "
+            "raise it for big Builder runs."
+        ),
+    )
+    poll_interval_seconds: float = Field(
+        30.0, ge=2.0, le=600.0,
+        description="How often to recheck status + databank count.",
+    )
+    stable_polls_required: int = Field(
+        3,
+        ge=1,
+        le=20,
+        description=(
+            "How many consecutive polls with zero databank growth AND status not running "
+            "before we declare the project done. Lower = faster detection, higher = more robust."
+        ),
+    )
+    require_log_completion_marker: bool = Field(
+        False,
+        description=(
+            "If True, also require 'All tasks completed' or a project_finished log event "
+            "before returning ok. If False, count stable-status polling as enough."
+        ),
+    )
+
+    @field_validator("project")
+    @classmethod
+    def _v_project(cls, v: str) -> str:
+        return validate_project_name(v)
+
+    @field_validator("databank")
+    @classmethod
+    def _v_databank(cls, v: str) -> str:
+        from sq_mcp._validation import validate_databank_name
+        return validate_databank_name(v)
+
+
+class ProjectRunToCompletionArgs(BaseModel):
+    project: str = Field(..., description="Project name (must be underscore-only — no spaces).")
+    databank: str = Field("Results", description="Databank to poll for growth.")
+    sync_databanks: list[str] | None = Field(
+        None,
+        description=(
+            "Databanks to sync from disk before starting (e.g. ['Strategies to retest'] "
+            "for a Retester run). Use this if you just dropped .sqx files into the input "
+            "databank — fixes the syncfromfiles race condition."
+        ),
+    )
+    sync_wait_seconds: float = Field(8.0, ge=0.0, le=300.0)
+    only_task: int | None = Field(None, ge=1, le=999)
+    from_task: int | None = Field(None, ge=1, le=999)
+    max_wait_seconds: float = Field(3600.0, ge=10.0, le=86_400.0)
+    poll_interval_seconds: float = Field(30.0, ge=2.0, le=600.0)
+    stable_polls_required: int = Field(3, ge=1, le=20)
+    force_sync_final: bool = Field(
+        True,
+        description=(
+            "After completion, call `-databank action=synctofiles` so JVM-resident results "
+            "are flushed to disk. Critical because most databanks default to "
+            "syncType=Auto-sync never."
+        ),
+    )
+
+    @field_validator("project")
+    @classmethod
+    def _v_project(cls, v: str) -> str:
+        v = validate_project_name(v)
+        if " " in v:
+            raise ValueError(
+                f"project name {v!r} contains spaces — sqcli's HTTP API parser cannot reference it. "
+                "Clone with an underscore-only name first."
+            )
+        return v
+
+    @field_validator("databank")
+    @classmethod
+    def _v_databank(cls, v: str) -> str:
+        from sq_mcp._validation import validate_databank_name
+        return validate_databank_name(v)
+
+
+class PipelineBuildFilterRetestArgs(BaseModel):
+    """One-shot Builder→Filter→Retester pipeline."""
+    builder_project: str = Field(
+        ...,
+        description=(
+            "Existing Builder project. Set start_builder=False to skip and use whatever's "
+            "already in its Results databank."
+        ),
+    )
+    retester_project: str = Field(
+        ...,
+        description=(
+            "Existing Retester project. The pipeline will copy filtered Builder survivors "
+            "into the Retester's input databank (typically 'Strategies to retest')."
+        ),
+    )
+    retester_input_databank: str = Field(
+        "Strategies to retest",
+        description="Retester input databank name. SQ X default is 'Strategies to retest'.",
+    )
+    top_n: int = Field(
+        30, ge=1, le=5000,
+        description="Max strategies to promote from Builder → Retester.",
+    )
+    start_builder: bool = Field(
+        True,
+        description="If True, kick off the Builder. If False, skip straight to filter step.",
+    )
+    start_retester: bool = Field(
+        True,
+        description="If True, kick off the Retester after promoting. If False, stop after copying.",
+    )
+    # Builder phase filter
+    builder_filter_min_trades: int | None = Field(20, ge=0)
+    builder_filter_max_drawdown_pct: float | None = Field(None, ge=0, le=100)
+    builder_filter_min_profit_to_dd: float | None = Field(1.5, ge=0)
+    builder_filter_min_fitness_is: float | None = Field(None)
+    builder_sort_by: Literal[
+        "fitness_is", "fitness_full", "profit_to_dd_ratio", "net_profit",
+    ] = Field("profit_to_dd_ratio")
+    # Pipeline timing
+    max_wait_builder_seconds: float = Field(
+        7200.0,
+        ge=10.0,
+        le=172_800.0,
+        description="Hard ceiling on Builder wait (10s..48h). Default 2h.",
+    )
+    max_wait_retester_seconds: float = Field(
+        3600.0,
+        ge=10.0,
+        le=86_400.0,
+    )
+    poll_interval_seconds: float = Field(60.0, ge=5.0, le=600.0)
+    stable_polls_required: int = Field(3, ge=1, le=20)
+    sync_wait_seconds: float = Field(
+        10.0, ge=0.0, le=120.0,
+        description="Wait after syncing the retester input databank before starting.",
+    )
+    dry_run: bool = Field(
+        False,
+        description="If True, run filter/promote but skip the engine start/wait phases.",
+    )
+
+    @field_validator("builder_project", "retester_project")
+    @classmethod
+    def _v_project(cls, v: str) -> str:
+        v = validate_project_name(v)
+        if " " in v:
+            raise ValueError(
+                f"project name {v!r} contains spaces — sqcli's HTTP API parser cannot reference it."
+            )
+        return v
+
+
+# ---- waiter & pipeline helpers ----------------------------------------------
+
+
+async def _wait_for_completion(
+    eng: EngineClient,
+    *,
+    project: str,
+    databank: str,
+    max_wait_seconds: float,
+    poll_interval_seconds: float,
+    stable_polls_required: int,
+    require_log_completion_marker: bool,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Shared logic for waiting until a project ends. Returns a structured report.
+
+    Done is declared when any of:
+      * status text contains 'finished'/'idle'/'stopped' AND databank growth has
+        been zero for `stable_polls_required` consecutive polls;
+      * (optionally) the engine log emits 'All tasks completed' since the call started.
+    Always returns within max_wait_seconds (caller checks `timed_out`).
+    """
+    deadline = time.time() + max_wait_seconds
+    start_time = time.time()
+    db_dir = eng.config.projects_dir / project / "databanks" / databank
+    prev_count = _count_sqx(db_dir)
+    stable_count = 0
+    snapshots: list[dict[str, Any]] = []
+    completion_marker_seen = False
+    baseline_log_len = len(eng.recent_log)
+
+    if ctx is not None:
+        await ctx.info(
+            f"waiting on {project!r} (max={max_wait_seconds:.0f}s, poll={poll_interval_seconds:.0f}s)"
+        )
+
+    while time.time() < deadline:
+        loop_start = time.time()
+        elapsed = loop_start - start_time
+
+        # status
+        status_text = ""
+        try:
+            status_text = await eng.call(f"-project action=status name={project}", timeout=30.0)
+        except EngineError:
+            pass
+        status_lower = status_text.lower()
+        looks_idle = bool(
+            status_text
+            and any(t in status_lower for t in ("finished", "idle", "stopped"))
+            and not any(t in status_lower for t in ("running", "in progress", "active"))
+        )
+
+        # databank count
+        current_count = _count_sqx(db_dir)
+        delta = current_count - prev_count
+
+        # log markers since baseline
+        if not completion_marker_seen:
+            for line in eng.recent_log[baseline_log_len:]:
+                if (
+                    "all tasks completed" in line.lower()
+                    or re.search(rf"Project\s+{re.escape(project)}\s+finished", line, re.IGNORECASE)
+                ):
+                    completion_marker_seen = True
+                    break
+
+        snapshot = {
+            "elapsed": round(elapsed, 1),
+            "count": current_count,
+            "delta": delta,
+            "looks_idle": looks_idle,
+            "completion_marker": completion_marker_seen,
+            "stable_count": stable_count,
+        }
+        snapshots.append(snapshot)
+        if ctx is not None and (delta != 0 or looks_idle or completion_marker_seen):
+            await ctx.info(
+                f"[wait/{project}] t={elapsed:.0f}s n={current_count} (+{delta}) "
+                f"idle={looks_idle} done={completion_marker_seen}"
+            )
+
+        if looks_idle and delta == 0:
+            stable_count += 1
+        else:
+            stable_count = 0
+        prev_count = current_count
+
+        if completion_marker_seen:
+            return _wait_result(
+                ok=True,
+                reason="completion_marker",
+                elapsed=elapsed,
+                final_count=current_count,
+                snapshots=snapshots,
+            )
+        if (
+            stable_count >= stable_polls_required
+            and (completion_marker_seen or not require_log_completion_marker)
+        ):
+            return _wait_result(
+                ok=True,
+                reason=f"stable_for_{stable_count}_polls",
+                elapsed=elapsed,
+                final_count=current_count,
+                snapshots=snapshots,
+            )
+
+        sleep_remaining = max(0.0, poll_interval_seconds - (time.time() - loop_start))
+        if sleep_remaining > 0:
+            await asyncio.sleep(sleep_remaining)
+
+    return _wait_result(
+        ok=False,
+        reason="timeout",
+        elapsed=time.time() - start_time,
+        final_count=_count_sqx(db_dir),
+        snapshots=snapshots,
+        timed_out=True,
+    )
+
+
+def _wait_result(
+    *,
+    ok: bool,
+    reason: str,
+    elapsed: float,
+    final_count: int,
+    snapshots: list[dict[str, Any]],
+    timed_out: bool = False,
+) -> dict[str, Any]:
+    """Compose the final wait report — last 10 snapshots + summary."""
+    return {
+        "ok": ok,
+        "completed": ok,
+        "timed_out": timed_out,
+        "reason": reason,
+        "elapsed_seconds": round(elapsed, 1),
+        "final_strategy_count": final_count,
+        "polls": len(snapshots),
+        "tail_snapshots": snapshots[-10:],
+    }
+
+
+def _count_sqx(db_dir: Path) -> int:
+    """Count .sqx files in a databank directory.
+
+    Returns 0 (not an exception) for missing/unreadable directories — callers
+    poll this every interval during long runs and we don't want a transient
+    permission glitch to break the waiter.
+    """
+    if not db_dir.exists():
+        return 0
+    try:
+        return sum(1 for _ in db_dir.rglob("*.sqx"))
+    except OSError:
+        return 0
 
     @field_validator("project")
     @classmethod
@@ -1886,7 +2246,7 @@ def register(mcp: FastMCP) -> None:
                     raw = src.read(item.filename)
                     if _is_task_xml(item.filename):
                         try:
-                            root = etree.fromstring(raw)
+                            root = safe_fromstring(raw)
                         except etree.XMLSyntaxError:
                             dst.writestr(item, raw)
                             continue
@@ -1913,7 +2273,7 @@ def register(mcp: FastMCP) -> None:
                                 root, encoding="UTF-8", xml_declaration=True, standalone=True
                             )
                     dst.writestr(item, raw)
-            cfx_path.write_bytes(buf.getvalue())
+            _atomic_write_bytes(cfx_path, buf.getvalue())
             return {
                 "ok": True,
                 "project": args.project,
@@ -1976,7 +2336,7 @@ def register(mcp: FastMCP) -> None:
                             # Validate: after patching, every element with both dateFrom+dateTo
                             # set as real dates (not "0") must satisfy dateFrom <= dateTo
                             try:
-                                root = etree.fromstring(patched)
+                                root = safe_fromstring(patched)
                                 for el in root.iter():
                                     df = el.get("dateFrom")
                                     dt = el.get("dateTo")
@@ -2016,7 +2376,7 @@ def register(mcp: FastMCP) -> None:
                 with zipfile.ZipFile(cfx_path, "r") as src:
                     for item in src.infolist():
                         dst.writestr(item, patched_files[item.filename])
-            cfx_path.write_bytes(buf.getvalue())
+            _atomic_write_bytes(cfx_path, buf.getvalue())
             return {
                 "ok": True,
                 "project": args.project,
@@ -2126,3 +2486,462 @@ def register(mcp: FastMCP) -> None:
             }
         except (EngineError, ValidationError) as exc:
             return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Block until a project finishes. Combines THREE completion signals so we don't "
+            "rely on any single one: (a) `-project action=status` reports finished/idle, "
+            "(b) databank strategy count is stable for N consecutive polls, (c) (optional) "
+            "log emits an 'All tasks completed' / 'project finished' marker. Returns a "
+            "structured report with the last 10 snapshots and final strategy count. "
+            "Hard-bounded by max_wait_seconds so the agent never blocks indefinitely."
+        )
+    )
+    async def project_wait_for_completion(
+        args: ProjectWaitForCompletionArgs, ctx: Context
+    ) -> dict:
+        try:
+            eng = get_engine(ctx)
+            result = await _wait_for_completion(
+                eng,
+                project=args.project,
+                databank=args.databank,
+                max_wait_seconds=args.max_wait_seconds,
+                poll_interval_seconds=args.poll_interval_seconds,
+                stable_polls_required=args.stable_polls_required,
+                require_log_completion_marker=args.require_log_completion_marker,
+                ctx=ctx,
+            )
+            return {**result, "project": args.project, "databank": args.databank}
+        except (EngineError, ValidationError) as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Atomic start-and-wait. Loads the project's .cfx, optionally syncs input "
+            "databanks (fixing the syncfromfiles race condition that produces 'No "
+            "strategies to retest'), kicks off the project, then blocks until completion. "
+            "After done, force-syncs the result databank so all strategies are flushed to "
+            "disk (most databanks default to syncType=Auto-sync never, leaving results "
+            "JVM-resident and invisible to file scans). Returns a full execution timeline "
+            "plus the final databank count. Use this for unattended single-project runs."
+        )
+    )
+    async def project_run_to_completion(
+        args: ProjectRunToCompletionArgs, ctx: Context
+    ) -> dict:
+        try:
+            eng = get_engine(ctx)
+            cfx_path = eng.config.projects_dir / args.project / "project.cfx"
+            if not cfx_path.is_file():
+                return {"ok": False, "error": f"project.cfx not found: {cfx_path}"}
+
+            timeline: list[dict[str, Any]] = []
+
+            t0 = time.time()
+            text = await eng.call(
+                f"-project action=loadconfig name={args.project} file={cfx_path}",
+                timeout=120.0,
+            )
+            timeline.append({"step": "loadconfig", "elapsed": round(time.time() - t0, 2), "raw": text.strip()[:200]})
+            if "Error" in text:
+                return {"ok": False, "error": "loadconfig failed", "timeline": timeline}
+
+            # input databank sync if requested
+            if args.sync_databanks:
+                for db in args.sync_databanks:
+                    t = time.time()
+                    text = await eng.call(
+                        f'-databank action=syncfromfiles project={args.project} name={_quote_if_space(db)}',
+                        timeout=300.0,
+                    )
+                    timeline.append({"step": f"syncfromfiles({db})", "elapsed": round(time.time() - t, 2),
+                                     "raw": text.strip()[:200]})
+                await ctx.info(f"waiting {args.sync_wait_seconds}s for sync to settle")
+                await asyncio.sleep(args.sync_wait_seconds)
+                timeline.append({"step": "sync_wait", "elapsed": args.sync_wait_seconds})
+
+            # start
+            t = time.time()
+            if args.only_task is not None:
+                cmd = f"-project action=startOnlyTask name={args.project} task={args.only_task}"
+            elif args.from_task is not None:
+                cmd = f"-project action=startFromTask name={args.project} task={args.from_task}"
+            else:
+                cmd = f"-project action=start name={args.project}"
+            text = await eng.call(cmd, timeout=60.0)
+            timeline.append({"step": "start", "elapsed": round(time.time() - t, 2), "raw": text.strip()[:200]})
+
+            if "Error" in text or "Nothing to" in text or "No strategies" in text:
+                return {
+                    "ok": False,
+                    "project": args.project,
+                    "error": f"engine refused start: {text.strip()[:200]}",
+                    "timeline": timeline,
+                    "hint": "Empty input databank? Try larger sync_wait_seconds or check the input databank.",
+                }
+
+            # wait
+            wait_result = await _wait_for_completion(
+                eng,
+                project=args.project,
+                databank=args.databank,
+                max_wait_seconds=args.max_wait_seconds,
+                poll_interval_seconds=args.poll_interval_seconds,
+                stable_polls_required=args.stable_polls_required,
+                require_log_completion_marker=False,
+                ctx=ctx,
+            )
+            timeline.append({"step": "wait", **wait_result})
+
+            # force sync the result databank if requested
+            if args.force_sync_final and wait_result.get("completed"):
+                t = time.time()
+                try:
+                    text = await eng.call(
+                        f"-databank action=synctofiles project={args.project} name={_quote_if_space(args.databank)}",
+                        timeout=300.0,
+                    )
+                    timeline.append({"step": "synctofiles", "elapsed": round(time.time() - t, 2),
+                                     "raw": text.strip()[:200]})
+                except EngineError as exc:
+                    timeline.append({"step": "synctofiles", "error": str(exc)})
+
+            final_count = _count_sqx(eng.config.projects_dir / args.project / "databanks" / args.databank)
+            return {
+                "ok": wait_result.get("completed", False),
+                "project": args.project,
+                "databank": args.databank,
+                "completed": wait_result.get("completed", False),
+                "timed_out": wait_result.get("timed_out", False),
+                "elapsed_seconds": wait_result.get("elapsed_seconds"),
+                "final_strategy_count": final_count,
+                "timeline": timeline,
+            }
+        except (EngineError, ValidationError) as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "End-to-end Builder → Filter → Retester pipeline. Single autonomous call:\n"
+            "  1. (optional) start the Builder project\n"
+            "  2. wait for Builder completion + force-sync Results\n"
+            "  3. filter Builder survivors by trades / drawdown / profit-to-DD / fitness\n"
+            "  4. promote top-N filtered survivors into the Retester's input databank\n"
+            "  5. (optional) start the Retester with proper syncfromfiles handling\n"
+            "  6. wait for Retester completion + force-sync its Results\n"
+            "Returns a full step-by-step timeline plus survivor counts at each phase. "
+            "Both projects must exist (use project_create_from_template first if not). "
+            "Set start_builder=False to skip phase 1 (use whatever Results already exist). "
+            "Set dry_run=True to do filter+promote only, without starting any engine work."
+        )
+    )
+    async def pipeline_build_filter_retest(
+        args: PipelineBuildFilterRetestArgs, ctx: Context
+    ) -> dict:
+        try:
+            eng = get_engine(ctx)
+            timeline: list[dict[str, Any]] = []
+            t_pipeline_start = time.time()
+
+            # Validate both projects exist
+            for proj in (args.builder_project, args.retester_project):
+                cfx = eng.config.projects_dir / proj / "project.cfx"
+                if not cfx.is_file():
+                    return {
+                        "ok": False,
+                        "error": f"project.cfx not found for {proj!r}: {cfx}",
+                        "hint": "Create the project (e.g. via project_create_from_template).",
+                    }
+
+            # ---- Phase 1: Builder ----
+            if args.start_builder and not args.dry_run:
+                await ctx.info(f"pipeline phase 1/4: starting Builder {args.builder_project!r}")
+                t = time.time()
+                builder_load = await eng.call(
+                    f"-project action=loadconfig name={args.builder_project} "
+                    f"file={eng.config.projects_dir / args.builder_project / 'project.cfx'}",
+                    timeout=120.0,
+                )
+                timeline.append({"phase": "builder_load", "elapsed": round(time.time() - t, 2),
+                                 "raw": builder_load.strip()[:200]})
+                t = time.time()
+                builder_start = await eng.call(
+                    f"-project action=start name={args.builder_project}", timeout=60.0
+                )
+                timeline.append({"phase": "builder_start", "elapsed": round(time.time() - t, 2),
+                                 "raw": builder_start.strip()[:200]})
+
+                wait = await _wait_for_completion(
+                    eng,
+                    project=args.builder_project,
+                    databank="Results",
+                    max_wait_seconds=args.max_wait_builder_seconds,
+                    poll_interval_seconds=args.poll_interval_seconds,
+                    stable_polls_required=args.stable_polls_required,
+                    require_log_completion_marker=False,
+                    ctx=ctx,
+                )
+                timeline.append({"phase": "builder_wait", **wait})
+                if not wait.get("completed"):
+                    return {
+                        "ok": False,
+                        "phase_failed": "builder_wait",
+                        "error": "Builder did not complete within max_wait_builder_seconds.",
+                        "timeline": timeline,
+                    }
+
+                # force-sync Builder Results
+                t = time.time()
+                try:
+                    sync_text = await eng.call(
+                        f"-databank action=synctofiles project={args.builder_project} name=Results",
+                        timeout=300.0,
+                    )
+                    timeline.append({"phase": "builder_synctofiles", "elapsed": round(time.time() - t, 2),
+                                     "raw": sync_text.strip()[:200]})
+                except EngineError as exc:
+                    timeline.append({"phase": "builder_synctofiles", "error": str(exc)})
+
+            # ---- Phase 2: Filter & rank ----
+            await ctx.info("pipeline phase 2/4: filtering Builder Results")
+            from sq_mcp.parsers.sqx import derive_metrics, parse_sqx
+            builder_results_dir = (
+                eng.config.projects_dir / args.builder_project / "databanks" / "Results"
+            )
+            if not builder_results_dir.exists():
+                return {
+                    "ok": False,
+                    "phase_failed": "filter",
+                    "error": f"Builder Results dir missing: {builder_results_dir}",
+                    "timeline": timeline,
+                }
+
+            candidates: list[dict[str, Any]] = []
+            scanned = 0
+            for sqx_path in sorted(builder_results_dir.rglob("*.sqx")):
+                scanned += 1
+                try:
+                    info = parse_sqx(sqx_path)
+                    m = derive_metrics(info)
+                except (ValueError, OSError):
+                    continue
+                if args.builder_filter_min_trades is not None and (m.get("trades") or 0) < args.builder_filter_min_trades:
+                    continue
+                if args.builder_filter_max_drawdown_pct is not None:
+                    dd = m.get("drawdown_pct")
+                    if dd is None or dd > args.builder_filter_max_drawdown_pct:
+                        continue
+                if args.builder_filter_min_profit_to_dd is not None:
+                    r = m.get("profit_to_dd_ratio")
+                    if r is None or r < args.builder_filter_min_profit_to_dd:
+                        continue
+                if args.builder_filter_min_fitness_is is not None:
+                    f = m.get("fitness_is")
+                    if f is None or f < args.builder_filter_min_fitness_is:
+                        continue
+                candidates.append({"path": sqx_path, "metrics": m,
+                                   "hash": (info.fingerprint.trades_hash if info.fingerprint else None)})
+
+            def _sort_key(c: dict) -> float:
+                v = c["metrics"].get(args.builder_sort_by)
+                return v if isinstance(v, (int, float)) else float("-inf")
+
+            candidates.sort(key=_sort_key, reverse=True)
+            picks = candidates[: args.top_n]
+            timeline.append({
+                "phase": "filter",
+                "scanned": scanned,
+                "survivors": len(candidates),
+                "promoted": len(picks),
+                "sort_by": args.builder_sort_by,
+            })
+
+            if not picks:
+                return {
+                    "ok": False,
+                    "phase_failed": "filter",
+                    "error": "No strategies passed the filter criteria.",
+                    "scanned": scanned,
+                    "timeline": timeline,
+                    "hint": "Relax the filter thresholds (e.g. lower builder_filter_min_profit_to_dd).",
+                }
+
+            # ---- Phase 3: Promote ----
+            retester_input_dir = (
+                eng.config.projects_dir / args.retester_project / "databanks" / args.retester_input_databank
+            )
+            retester_input_dir.mkdir(parents=True, exist_ok=True)
+            existing_hashes = _existing_dest_hashes(retester_input_dir)
+            promoted: list[dict[str, Any]] = []
+            for pick in picks:
+                if pick["hash"] and pick["hash"] in existing_hashes:
+                    continue
+                src_p: Path = pick["path"]
+                dst_p = retester_input_dir / src_p.name
+                if dst_p.exists():
+                    stem, suffix = dst_p.stem, dst_p.suffix
+                    n = 2
+                    while (retester_input_dir / f"{stem}_v{n}{suffix}").exists():
+                        n += 1
+                    dst_p = retester_input_dir / f"{stem}_v{n}{suffix}"
+                if not args.dry_run:
+                    shutil.copy2(src_p, dst_p)
+                promoted.append({"src": str(src_p), "dest": str(dst_p),
+                                 "metrics": pick["metrics"], "hash": pick["hash"]})
+                if pick["hash"]:
+                    existing_hashes.add(pick["hash"])
+            timeline.append({"phase": "promote", "count": len(promoted)})
+
+            # ---- Phase 4: Retester ----
+            if args.start_retester and not args.dry_run:
+                await ctx.info(f"pipeline phase 4/4: starting Retester {args.retester_project!r}")
+                t = time.time()
+                retester_load = await eng.call(
+                    f"-project action=loadconfig name={args.retester_project} "
+                    f"file={eng.config.projects_dir / args.retester_project / 'project.cfx'}",
+                    timeout=120.0,
+                )
+                timeline.append({"phase": "retester_load", "elapsed": round(time.time() - t, 2),
+                                 "raw": retester_load.strip()[:200]})
+
+                t = time.time()
+                try:
+                    sync_text = await eng.call(
+                        f'-databank action=syncfromfiles project={args.retester_project} '
+                        f'name={_quote_if_space(args.retester_input_databank)}',
+                        timeout=300.0,
+                    )
+                    timeline.append({"phase": "retester_syncfromfiles", "elapsed": round(time.time() - t, 2),
+                                     "raw": sync_text.strip()[:200]})
+                except EngineError as exc:
+                    timeline.append({"phase": "retester_syncfromfiles", "error": str(exc)})
+
+                await ctx.info(f"waiting {args.sync_wait_seconds}s for retester sync")
+                await asyncio.sleep(args.sync_wait_seconds)
+
+                t = time.time()
+                retester_start = await eng.call(
+                    f"-project action=start name={args.retester_project}", timeout=60.0
+                )
+                timeline.append({"phase": "retester_start", "elapsed": round(time.time() - t, 2),
+                                 "raw": retester_start.strip()[:200]})
+                if "Error" in retester_start or "No strategies" in retester_start:
+                    return {
+                        "ok": False,
+                        "phase_failed": "retester_start",
+                        "error": f"Retester refused start: {retester_start.strip()[:200]}",
+                        "timeline": timeline,
+                    }
+
+                wait = await _wait_for_completion(
+                    eng,
+                    project=args.retester_project,
+                    databank="Results",
+                    max_wait_seconds=args.max_wait_retester_seconds,
+                    poll_interval_seconds=args.poll_interval_seconds,
+                    stable_polls_required=args.stable_polls_required,
+                    require_log_completion_marker=False,
+                    ctx=ctx,
+                )
+                timeline.append({"phase": "retester_wait", **wait})
+                if not wait.get("completed"):
+                    return {
+                        "ok": False,
+                        "phase_failed": "retester_wait",
+                        "error": "Retester did not complete within max_wait_retester_seconds.",
+                        "timeline": timeline,
+                    }
+
+                # final sync
+                try:
+                    sync_text = await eng.call(
+                        f"-databank action=synctofiles project={args.retester_project} name=Results",
+                        timeout=300.0,
+                    )
+                    timeline.append({"phase": "retester_synctofiles", "raw": sync_text.strip()[:200]})
+                except EngineError as exc:
+                    timeline.append({"phase": "retester_synctofiles", "error": str(exc)})
+
+            retester_results_dir = (
+                eng.config.projects_dir / args.retester_project / "databanks" / "Results"
+            )
+            retester_final_count = _count_sqx(retester_results_dir)
+
+            return {
+                "ok": True,
+                "builder_project": args.builder_project,
+                "retester_project": args.retester_project,
+                "builder_scanned": scanned,
+                "filter_survivors": len(candidates),
+                "promoted_to_retester": len(promoted),
+                "retester_final_count": retester_final_count,
+                "elapsed_seconds": round(time.time() - t_pipeline_start, 2),
+                "promoted_paths": [p["dest"] for p in promoted],
+                "dry_run": args.dry_run,
+                "timeline": timeline,
+            }
+        except (EngineError, ValidationError, OSError) as exc:
+            return safe_error_payload(exc)
+
+
+    @mcp.tool(
+        description=(
+            "Query sqcli's built-in help. Omit `command` for the top-level command "
+            "list; pass `command='project'` (etc.) for action/parameter details. The "
+            "engine truncates large help text at ~1KB and appends '(N more lines, M "
+            "bytes total)' — we surface that footer so the caller knows the response "
+            "is partial. Useful for discovering what's actually supported in the "
+            "running build before issuing a command."
+        )
+    )
+    async def engine_help(args: EngineHelpArgs, ctx: Context) -> dict:
+        try:
+            eng = get_engine(ctx)
+            if args.command:
+                cmd = f"-h -{args.command}"
+            else:
+                cmd = "-h"
+            text = await eng.call(cmd, timeout=15.0)
+            stripped = text.strip()
+            truncated_marker = None
+            m = re.search(r"\((\d+) more lines?,\s*(\d+) bytes total\)", stripped)
+            if m:
+                truncated_marker = {
+                    "more_lines": int(m.group(1)),
+                    "total_bytes": int(m.group(2)),
+                }
+            return {
+                "ok": True,
+                "command": args.command,
+                "raw": stripped,
+                "lines": parse_list(stripped),
+                "truncated": truncated_marker is not None,
+                "truncated_marker": truncated_marker,
+            }
+        except (EngineError, ValidationError) as exc:
+            return safe_error_payload(exc)
+
+
+def _existing_dest_hashes(dest_dir: Path) -> set[str]:
+    """Best-effort hash dedupe set for the pipeline (avoids re-import on rerun).
+
+    Defensive: silently degrades to an empty set on permission/IO errors so a
+    single corrupt file doesn't break a multi-hour pipeline call.
+    """
+    from sq_mcp.parsers.sqx import parse_sqx
+    out: set[str] = set()
+    if not dest_dir.exists():
+        return out
+    try:
+        paths = list(dest_dir.rglob("*.sqx"))
+    except OSError:
+        return out
+    for sqx_path in paths:
+        try:
+            info = parse_sqx(sqx_path)
+            if info.fingerprint and info.fingerprint.trades_hash:
+                out.add(info.fingerprint.trades_hash)
+        except (ValueError, OSError):
+            continue
+    return out

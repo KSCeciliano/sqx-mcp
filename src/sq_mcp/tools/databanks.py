@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import shutil
 import zipfile
 from pathlib import Path
 from typing import Any, Literal
@@ -18,8 +19,10 @@ from sq_mcp._validation import (
     validate_project_name,
     validate_strategy_list,
 )
+from sq_mcp._xml import safe_fromstring
 from sq_mcp.engine import EngineError
 from sq_mcp.parsers import parse_sqx
+from sq_mcp.parsers.sqx import derive_metrics
 from sq_mcp.tools._common import (
     get_engine,
     is_status_only_response,
@@ -85,7 +88,7 @@ def _extract_sqx_contents(
 def _canonicalize_xml(raw: bytes) -> str:
     """Pretty-print XML with sorted attributes so diffs aren't noisy on reorderings."""
     try:
-        root = etree.fromstring(raw)
+        root = safe_fromstring(raw)
     except etree.XMLSyntaxError:
         return raw.decode("utf-8", errors="replace")
     # Sort attributes on every element for stable comparison
@@ -305,6 +308,287 @@ class DatabankTopNArgs(BaseModel):
     @classmethod
     def _v_databank(cls, v: str) -> str:
         return validate_databank_name(v)
+
+
+# Metrics that databank_filter and databank_rank can be sorted on / filtered by.
+_FILTERABLE_METRICS = (
+    "fitness_is",
+    "fitness_oos",
+    "fitness_full",
+    "fitness_strategy",
+    "trades",
+    "net_profit",
+    "drawdown_abs",
+    "return_pct",
+    "drawdown_pct",
+    "profit_to_dd_ratio",
+    "avg_trade",
+    "trades_per_year",
+    "oos_is_ratio",
+    "complexity",
+    "history_years",
+)
+
+
+class DatabankFilterArgs(BaseModel):
+    project: str = Field(..., description="Project name.")
+    databank: str = Field(
+        "Results",
+        description="Databank folder name (under project's databanks/).",
+    )
+    # filter thresholds — every field is optional; omitted means no constraint
+    min_trades: int | None = Field(None, ge=0)
+    max_trades: int | None = Field(None, ge=0)
+    min_net_profit: float | None = None
+    max_drawdown_abs: float | None = Field(None, ge=0)
+    max_drawdown_pct: float | None = Field(None, ge=0, le=100)
+    min_profit_to_dd_ratio: float | None = Field(None, ge=0)
+    min_fitness_is: float | None = None
+    min_fitness_oos: float | None = None
+    min_oos_is_ratio: float | None = Field(
+        None,
+        description=(
+            "Minimum OOS/IS fitness ratio (0..1). Use ~0.7 to demand minimal IS→OOS "
+            "degradation. Strategies missing OOS data are excluded when this is set."
+        ),
+    )
+    min_avg_trade: float | None = None
+    min_trades_per_year: float | None = Field(None, ge=0)
+    max_complexity: int | None = Field(None, ge=1)
+    exclude_ambiguous: bool = Field(
+        False,
+        description="If True, drop strategies whose Fingerprint reports ambiguous trades.",
+    )
+    sort_by: Literal[
+        "fitness_is", "fitness_oos", "fitness_full", "fitness_strategy",
+        "trades", "net_profit", "drawdown_abs",
+        "return_pct", "drawdown_pct",
+        "profit_to_dd_ratio", "avg_trade", "trades_per_year", "oos_is_ratio",
+        "complexity", "history_years",
+    ] = Field("profit_to_dd_ratio")
+    descending: bool = Field(True)
+    limit: int = Field(50, ge=1, le=5000)
+
+    @field_validator("project")
+    @classmethod
+    def _v_project(cls, v: str) -> str:
+        return validate_project_name(v)
+
+    @field_validator("databank")
+    @classmethod
+    def _v_databank(cls, v: str) -> str:
+        return validate_databank_name(v)
+
+
+class DatabankPromoteArgs(BaseModel):
+    """Move top-N (optionally filtered) strategies from one databank to another."""
+    source_project: str = Field(..., description="Source project.")
+    source_databank: str = Field(
+        "Results", description="Source databank folder."
+    )
+    dest_project: str = Field(..., description="Destination project (may equal source).")
+    dest_databank: str = Field(
+        ...,
+        description=(
+            "Destination databank folder. Use 'Strategies to retest' for a Retester "
+            "input or 'Strategies to optimize' for an Optimizer input. "
+            "Created if missing."
+        ),
+    )
+    top_n: int = Field(10, ge=1, le=5000)
+    sort_by: Literal[
+        "fitness_is", "fitness_oos", "fitness_full", "fitness_strategy",
+        "net_profit", "drawdown_abs", "profit_to_dd_ratio",
+        "return_pct", "trades", "avg_trade", "oos_is_ratio",
+    ] = Field("profit_to_dd_ratio")
+    descending: bool = Field(True)
+    # Optional filter pre-stage. Defaults are pass-through.
+    min_trades: int | None = Field(None, ge=0)
+    max_drawdown_pct: float | None = Field(None, ge=0, le=100)
+    min_profit_to_dd_ratio: float | None = Field(None, ge=0)
+    min_fitness_oos: float | None = None
+    min_oos_is_ratio: float | None = Field(None, ge=0, le=2.0)
+    dedupe_by_hash: bool = Field(
+        True,
+        description=(
+            "If True, skip strategies whose Fingerprint trades_hash already exists in "
+            "the destination — prevents re-promoting the exact same backtest."
+        ),
+    )
+    overwrite: bool = Field(
+        False,
+        description=(
+            "If True, overwrite a destination file with the same .sqx basename. "
+            "If False, rename to <name>_v2.sqx, <name>_v3.sqx... on collision."
+        ),
+    )
+    dry_run: bool = Field(
+        False, description="Show what WOULD be copied without writing any files."
+    )
+
+    @field_validator("source_project", "dest_project")
+    @classmethod
+    def _v_project(cls, v: str) -> str:
+        return validate_project_name(v)
+
+    @field_validator("source_databank", "dest_databank")
+    @classmethod
+    def _v_databank(cls, v: str) -> str:
+        return validate_databank_name(v)
+
+
+class DatabankMergeArgs(BaseModel):
+    """Combine .sqx files from multiple databanks into a single destination."""
+    sources: list[dict[str, str]] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description=(
+            "List of {project, databank} pairs to merge. Order is preserved — "
+            "first source wins on hash collisions when dedupe_by_hash=True."
+        ),
+    )
+    dest_project: str = Field(..., description="Destination project.")
+    dest_databank: str = Field(
+        ..., description="Destination databank folder. Created if missing."
+    )
+    dedupe_by_hash: bool = Field(True)
+    dry_run: bool = Field(False)
+
+    @field_validator("dest_project")
+    @classmethod
+    def _v_dest_project(cls, v: str) -> str:
+        return validate_project_name(v)
+
+    @field_validator("dest_databank")
+    @classmethod
+    def _v_dest_databank(cls, v: str) -> str:
+        return validate_databank_name(v)
+
+    @field_validator("sources")
+    @classmethod
+    def _v_sources(cls, v: list[dict[str, str]]) -> list[dict[str, str]]:
+        clean: list[dict[str, str]] = []
+        for entry in v:
+            if "project" not in entry or "databank" not in entry:
+                raise ValueError("each source must have 'project' and 'databank' keys")
+            clean.append(
+                {
+                    "project": validate_project_name(entry["project"]),
+                    "databank": validate_databank_name(entry["databank"]),
+                }
+            )
+        return clean
+
+
+def _existing_hashes(databank_dir: Path) -> set[str]:
+    """Return the set of trades_hash values already present in a databank dir.
+
+    Defensive: catches OS errors during enumeration so a permission glitch
+    on a stray file doesn't kill the whole promote/merge call.
+    """
+    out: set[str] = set()
+    if not databank_dir.exists():
+        return out
+    try:
+        paths = list(databank_dir.rglob("*.sqx"))
+    except OSError:
+        return out
+    for sqx_path in paths:
+        try:
+            info = parse_sqx(sqx_path)
+            if info.fingerprint and info.fingerprint.trades_hash:
+                out.add(info.fingerprint.trades_hash)
+        except (ValueError, OSError):
+            continue
+    return out
+
+
+# Iteration cap on the _vN suffix loop. If a databank somehow has 9999 versions
+# of the same strategy something is wrong upstream — bail loudly rather than
+# burning CPU forever on a broken filesystem.
+_MAX_VERSION_SUFFIX = 9999
+
+
+def _resolve_destination_filename(dest_dir: Path, basename: str, overwrite: bool) -> Path:
+    """Pick a destination path that does not clobber an existing file.
+
+    If `overwrite=True`, returns the basename even if a file already lives there.
+    Otherwise, appends `_v2`, `_v3`, ... until a non-existent path is found, or
+    raises `RuntimeError` if the search exceeds _MAX_VERSION_SUFFIX (signals
+    something is broken upstream).
+    """
+    dest = dest_dir / basename
+    if not dest.exists() or overwrite:
+        return dest
+    stem = dest.stem
+    suffix = dest.suffix
+    for n in range(2, _MAX_VERSION_SUFFIX + 1):
+        candidate = dest_dir / f"{stem}_v{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(
+        f"could not find a free destination for {basename!r} after "
+        f"{_MAX_VERSION_SUFFIX} attempts under {dest_dir}"
+    )
+
+
+def _passes_filter(m: dict, args: DatabankFilterArgs) -> tuple[bool, str | None]:
+    """Return (passes, fail_reason). fail_reason is None when passing."""
+    def _check(condition: bool, reason: str) -> tuple[bool, str | None]:
+        return (True, None) if condition else (False, reason)
+
+    if args.min_trades is not None:
+        n = m.get("trades")
+        if n is None or n < args.min_trades:
+            return False, f"trades<{args.min_trades}"
+    if args.max_trades is not None:
+        n = m.get("trades")
+        if n is not None and n > args.max_trades:
+            return False, f"trades>{args.max_trades}"
+    if args.min_net_profit is not None:
+        p = m.get("net_profit")
+        if p is None or p < args.min_net_profit:
+            return False, f"net_profit<{args.min_net_profit}"
+    if args.max_drawdown_abs is not None:
+        d = m.get("drawdown_abs")
+        if d is None or d > args.max_drawdown_abs:
+            return False, f"drawdown_abs>{args.max_drawdown_abs}"
+    if args.max_drawdown_pct is not None:
+        d = m.get("drawdown_pct")
+        if d is None or d > args.max_drawdown_pct:
+            return False, f"drawdown_pct>{args.max_drawdown_pct}"
+    if args.min_profit_to_dd_ratio is not None:
+        r = m.get("profit_to_dd_ratio")
+        if r is None or r < args.min_profit_to_dd_ratio:
+            return False, f"profit_to_dd<{args.min_profit_to_dd_ratio}"
+    if args.min_fitness_is is not None:
+        f = m.get("fitness_is")
+        if f is None or f < args.min_fitness_is:
+            return False, f"fitness_is<{args.min_fitness_is}"
+    if args.min_fitness_oos is not None:
+        f = m.get("fitness_oos")
+        if f is None or f < args.min_fitness_oos:
+            return False, f"fitness_oos<{args.min_fitness_oos}"
+    if args.min_oos_is_ratio is not None:
+        r = m.get("oos_is_ratio")
+        if r is None or r < args.min_oos_is_ratio:
+            return False, f"oos_is_ratio<{args.min_oos_is_ratio}"
+    if args.min_avg_trade is not None:
+        a = m.get("avg_trade")
+        if a is None or a < args.min_avg_trade:
+            return False, f"avg_trade<{args.min_avg_trade}"
+    if args.min_trades_per_year is not None:
+        a = m.get("trades_per_year")
+        if a is None or a < args.min_trades_per_year:
+            return False, f"trades_per_year<{args.min_trades_per_year}"
+    if args.max_complexity is not None:
+        c = m.get("complexity")
+        if c is not None and c > args.max_complexity:
+            return False, f"complexity>{args.max_complexity}"
+    if args.exclude_ambiguous and m.get("ambiguous_trades"):
+        return False, "ambiguous_trades>0"
+    return True, None
 
 
 def _pick_result(info, result_name: str | None):
@@ -654,6 +938,305 @@ def register(mcp: FastMCP) -> None:
                 "unparseable_count": len(unparseable),
                 "top": sortable[: args.top_n],
                 "unparseable": unparseable[:10],  # cap for response size
+            }
+        except (EngineError, ValidationError) as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Filter strategies in a databank by performance/robustness criteria. "
+            "Reads .sqx files directly (no engine call) and returns the subset that "
+            "satisfies every supplied threshold, sorted by the chosen metric. Returns "
+            "BOTH the survivors and a per-criterion rejection breakdown so callers can "
+            "see which constraint is the bottleneck. Filters are the building block for "
+            "promoting strategies into a Retester/Optimizer input databank. Metrics: "
+            "trades, net_profit, drawdown_abs/pct, profit_to_dd_ratio, fitness_is/oos, "
+            "oos_is_ratio (overfit detector), avg_trade, trades_per_year, complexity."
+        )
+    )
+    async def databank_filter(args: DatabankFilterArgs, ctx: Context) -> dict:
+        try:
+            eng = get_engine(ctx)
+            db_dir = eng.config.projects_dir / args.project / "databanks" / args.databank
+            if not db_dir.exists():
+                return {
+                    "ok": False,
+                    "error": f"databank directory not found: {db_dir}",
+                    "project": args.project,
+                    "databank": args.databank,
+                }
+            survivors: list[dict] = []
+            rejected_reasons: dict[str, int] = {}
+            unparseable: list[dict] = []
+            total = 0
+            for sqx_path in sorted(db_dir.rglob("*.sqx")):
+                total += 1
+                try:
+                    info = parse_sqx(sqx_path)
+                    m = derive_metrics(info)
+                except (ValueError, OSError) as exc:
+                    unparseable.append(
+                        {"file": str(sqx_path.relative_to(db_dir)), "reason": str(exc)}
+                    )
+                    continue
+                ok, reason = _passes_filter(m, args)
+                if ok:
+                    survivors.append(
+                        {
+                            "file": str(sqx_path.relative_to(db_dir)),
+                            "abs_path": str(sqx_path),
+                            "metrics": m,
+                        }
+                    )
+                else:
+                    rejected_reasons[reason or "unknown"] = (
+                        rejected_reasons.get(reason or "unknown", 0) + 1
+                    )
+
+            def _key(entry: dict) -> float:
+                v = entry["metrics"].get(args.sort_by)
+                return v if isinstance(v, (int, float)) else (
+                    float("-inf") if args.descending else float("inf")
+                )
+
+            survivors.sort(key=_key, reverse=args.descending)
+            return {
+                "ok": True,
+                "project": args.project,
+                "databank": args.databank,
+                "databank_dir": str(db_dir),
+                "scanned": total,
+                "survivors_count": len(survivors),
+                "rejected_count": sum(rejected_reasons.values()),
+                "rejected_by_reason": rejected_reasons,
+                "unparseable_count": len(unparseable),
+                "unparseable_sample": unparseable[:10],
+                "sort_by": args.sort_by,
+                "descending": args.descending,
+                "survivors": survivors[: args.limit],
+                "survivors_truncated": len(survivors) > args.limit,
+            }
+        except (EngineError, ValidationError) as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Promote top-N strategies from one databank to another by copying .sqx files. "
+            "Optional pre-filter on trades / drawdown_pct / profit_to_dd / fitness_oos / "
+            "oos_is_ratio. Default sort is profit_to_dd_ratio descending (a robust "
+            "ranking that penalizes oversized DD). Destination is created if missing. "
+            "By default dedupes by Fingerprint trades_hash so re-runs don't multiply the "
+            "same backtest. Set dry_run=True to preview without writing. This is the "
+            "primary tool for staging Retester / Optimizer inputs from a Builder "
+            "output databank."
+        )
+    )
+    async def databank_promote(args: DatabankPromoteArgs, ctx: Context) -> dict:
+        try:
+            eng = get_engine(ctx)
+            src_dir = (
+                eng.config.projects_dir / args.source_project / "databanks" / args.source_databank
+            )
+            dst_dir = (
+                eng.config.projects_dir / args.dest_project / "databanks" / args.dest_databank
+            )
+            if not src_dir.exists():
+                return {"ok": False, "error": f"source databank not found: {src_dir}"}
+            # Materialize destination project dir if needed
+            if not (eng.config.projects_dir / args.dest_project).exists():
+                return {
+                    "ok": False,
+                    "error": (
+                        f"destination project does not exist: {args.dest_project}. "
+                        "Create it (e.g. via project_create_from_template) first."
+                    ),
+                }
+            if not args.dry_run:
+                dst_dir.mkdir(parents=True, exist_ok=True)
+
+            existing_hashes = _existing_hashes(dst_dir) if args.dedupe_by_hash else set()
+
+            # 1) Load + filter + rank source strategies
+            candidates: list[dict] = []
+            unparseable: list[dict] = []
+            for sqx_path in sorted(src_dir.rglob("*.sqx")):
+                try:
+                    info = parse_sqx(sqx_path)
+                    m = derive_metrics(info)
+                except (ValueError, OSError) as exc:
+                    unparseable.append({"file": sqx_path.name, "reason": str(exc)})
+                    continue
+                # apply lightweight filter inline
+                if args.min_trades is not None and (m.get("trades") or 0) < args.min_trades:
+                    continue
+                if args.max_drawdown_pct is not None:
+                    dd = m.get("drawdown_pct")
+                    if dd is None or dd > args.max_drawdown_pct:
+                        continue
+                if args.min_profit_to_dd_ratio is not None:
+                    r = m.get("profit_to_dd_ratio")
+                    if r is None or r < args.min_profit_to_dd_ratio:
+                        continue
+                if args.min_fitness_oos is not None:
+                    f = m.get("fitness_oos")
+                    if f is None or f < args.min_fitness_oos:
+                        continue
+                if args.min_oos_is_ratio is not None:
+                    r = m.get("oos_is_ratio")
+                    if r is None or r < args.min_oos_is_ratio:
+                        continue
+                candidates.append(
+                    {
+                        "src_path": sqx_path,
+                        "metrics": m,
+                        "hash": (info.fingerprint.trades_hash if info.fingerprint else None),
+                    }
+                )
+
+            def _sort_key(entry: dict) -> float:
+                v = entry["metrics"].get(args.sort_by)
+                return v if isinstance(v, (int, float)) else (
+                    float("-inf") if args.descending else float("inf")
+                )
+
+            candidates.sort(key=_sort_key, reverse=args.descending)
+
+            # 2) Pick top N respecting dedupe
+            picks: list[dict] = []
+            skipped_dupes: list[str] = []
+            for entry in candidates:
+                h = entry["hash"]
+                if args.dedupe_by_hash and h and h in existing_hashes:
+                    skipped_dupes.append(entry["src_path"].name)
+                    continue
+                picks.append(entry)
+                if h:
+                    existing_hashes.add(h)
+                if len(picks) >= args.top_n:
+                    break
+
+            # 3) Copy
+            copied: list[dict] = []
+            for entry in picks:
+                src_p: Path = entry["src_path"]
+                dst_p = _resolve_destination_filename(dst_dir, src_p.name, args.overwrite)
+                copied.append(
+                    {
+                        "src": str(src_p),
+                        "dest": str(dst_p),
+                        "metrics": entry["metrics"],
+                        "hash": entry["hash"],
+                    }
+                )
+                if not args.dry_run:
+                    shutil.copy2(src_p, dst_p)
+
+            return {
+                "ok": True,
+                "source_project": args.source_project,
+                "source_databank": args.source_databank,
+                "dest_project": args.dest_project,
+                "dest_databank": args.dest_databank,
+                "dest_dir": str(dst_dir),
+                "scanned": len(candidates) + len(unparseable),
+                "filtered_candidates": len(candidates),
+                "promoted_count": len(copied),
+                "skipped_duplicates": skipped_dupes,
+                "unparseable_count": len(unparseable),
+                "dry_run": args.dry_run,
+                "promoted": copied,
+                "hint": (
+                    "After promoting, call project_load_and_start with sync_databanks=['"
+                    + args.dest_databank
+                    + "'] so the engine picks up the new files before kicking off the run."
+                ),
+            }
+        except (EngineError, ValidationError) as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Merge .sqx files from multiple source databanks into a single destination "
+            "databank. Dedupes by Fingerprint trades_hash (first source wins on conflict). "
+            "Useful for combining results from parallel Builder runs or pooling survivors "
+            "from several robustness tests. Destination created if missing."
+        )
+    )
+    async def databank_merge(args: DatabankMergeArgs, ctx: Context) -> dict:
+        try:
+            eng = get_engine(ctx)
+            dst_dir = (
+                eng.config.projects_dir / args.dest_project / "databanks" / args.dest_databank
+            )
+            if not (eng.config.projects_dir / args.dest_project).exists():
+                return {
+                    "ok": False,
+                    "error": (
+                        f"destination project does not exist: {args.dest_project}. "
+                        "Create it first."
+                    ),
+                }
+            if not args.dry_run:
+                dst_dir.mkdir(parents=True, exist_ok=True)
+
+            seen_hashes: set[str] = _existing_hashes(dst_dir) if args.dedupe_by_hash else set()
+            copied: list[dict] = []
+            skipped: list[dict] = []
+            missing_sources: list[dict] = []
+            total_scanned = 0
+
+            for source in args.sources:
+                src_dir = (
+                    eng.config.projects_dir
+                    / source["project"]
+                    / "databanks"
+                    / source["databank"]
+                )
+                if not src_dir.exists():
+                    missing_sources.append({**source, "path": str(src_dir)})
+                    continue
+                for sqx_path in sorted(src_dir.rglob("*.sqx")):
+                    total_scanned += 1
+                    h: str | None = None
+                    if args.dedupe_by_hash:
+                        try:
+                            info = parse_sqx(sqx_path)
+                            h = info.fingerprint.trades_hash if info.fingerprint else None
+                        except (ValueError, OSError):
+                            h = None
+                        if h and h in seen_hashes:
+                            skipped.append(
+                                {"src": str(sqx_path), "reason": "duplicate_hash", "hash": h}
+                            )
+                            continue
+                    dst_path = _resolve_destination_filename(dst_dir, sqx_path.name, overwrite=False)
+                    if not args.dry_run:
+                        shutil.copy2(sqx_path, dst_path)
+                    copied.append(
+                        {
+                            "src": str(sqx_path),
+                            "dest": str(dst_path),
+                            "hash": h,
+                            "from_project": source["project"],
+                            "from_databank": source["databank"],
+                        }
+                    )
+                    if h:
+                        seen_hashes.add(h)
+
+            return {
+                "ok": True,
+                "dest_project": args.dest_project,
+                "dest_databank": args.dest_databank,
+                "dest_dir": str(dst_dir),
+                "scanned": total_scanned,
+                "copied_count": len(copied),
+                "skipped_count": len(skipped),
+                "missing_sources": missing_sources,
+                "dry_run": args.dry_run,
+                "copied": copied[:500],  # cap response size
+                "skipped": skipped[:100],
+                "copied_truncated": len(copied) > 500,
             }
         except (EngineError, ValidationError) as exc:
             return safe_error_payload(exc)

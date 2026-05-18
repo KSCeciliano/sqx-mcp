@@ -1,7 +1,8 @@
-"""Historical data tools — import, update, export, list."""
+"""Historical data tools — import, update, export, list, coverage check."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -11,6 +12,7 @@ from sq_mcp._validation import (
     ValidationError,
     resolve_safe_path,
     validate_date,
+    validate_project_name,
     validate_symbol,
     validate_timeframe,
 )
@@ -83,6 +85,141 @@ class DataExportArgs(BaseModel):
     @classmethod
     def _v_date(cls, v: str | None) -> str | None:
         return validate_date(v) if v else v
+
+
+class DataCoverageCheckArgs(BaseModel):
+    """Verify local data covers a requested test window.
+
+    Exactly one of (project) or (symbol + timeframe + date_from + date_to) must be set.
+    """
+    project: str | None = Field(
+        None,
+        description=(
+            "Project name. If set, the tool mines referenced symbols and date "
+            "ranges from the project's .cfx and checks each."
+        ),
+    )
+    symbol: str | None = Field(None, description="Explicit symbol to check.")
+    timeframe: str | None = Field("M1", description="Explicit timeframe.")
+    date_from: str | None = Field(None, description="Requested start (yyyy.MM.dd).")
+    date_to: str | None = Field(None, description="Requested end (yyyy.MM.dd).")
+
+    @field_validator("project")
+    @classmethod
+    def _v_project(cls, v: str | None) -> str | None:
+        return validate_project_name(v) if v else v
+
+    @field_validator("symbol")
+    @classmethod
+    def _v_symbol(cls, v: str | None) -> str | None:
+        return validate_symbol(v) if v else v
+
+    @field_validator("timeframe")
+    @classmethod
+    def _v_tf(cls, v: str | None) -> str | None:
+        return validate_timeframe(v) if v else v
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _v_date(cls, v: str | None) -> str | None:
+        return validate_date(v) if v else v
+
+
+def _check_symbol_coverage(
+    *, eng, symbol: str, timeframe: str | None, date_from: str | None, date_to: str | None
+) -> dict:
+    """Return a coverage report for one (symbol, tf, date_window) tuple."""
+    from sq_mcp.tools.symbols import _open_data_registry, _query_data_registry
+
+    history_root = eng.config.history_dir
+    base = symbol.split("_")[0]
+    history_dir = None
+    for cand in (history_root / symbol, history_root / base):
+        if cand.is_dir():
+            history_dir = cand
+            break
+
+    out: dict = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "requested_date_from": date_from,
+        "requested_date_to": date_to,
+        "history_dir_present": history_dir is not None,
+        "history_dir": str(history_dir) if history_dir else None,
+        "issues": [],
+    }
+
+    # .dat presence
+    dat_count = 0
+    dat_size_total = 0
+    if history_dir is not None:
+        try:
+            for f in history_dir.glob("*.dat"):
+                dat_count += 1
+                try:
+                    dat_size_total += f.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    out["dat_count"] = dat_count
+    out["dat_size_bytes"] = dat_size_total
+    if dat_count == 0:
+        out["issues"].append(
+            {"severity": "high", "code": "NO_LOCAL_DAT",
+             "message": f"no .dat history under {history_root}/{symbol} (or /{base})"}
+        )
+
+    # registry
+    con = _open_data_registry(eng.config.data_dir)
+    registry_rows = []
+    if con is not None:
+        try:
+            registry_rows = _query_data_registry(con, symbol=symbol, timeframe=timeframe)
+        finally:
+            con.close()
+    out["registry_rows"] = registry_rows
+    if not registry_rows:
+        out["issues"].append(
+            {"severity": "high", "code": "NOT_IN_REGISTRY",
+             "message": f"symbol {symbol!r} TF {timeframe!r} not in data.db DATA table"}
+        )
+    else:
+        # Window check against the first registry row (most relevant TF match)
+        row = registry_rows[0]
+        reg_from_ms = row.get("DATEFROM")
+        reg_to_ms = row.get("DATETO")
+        if date_from and reg_from_ms:
+            try:
+                y, m, d = date_from.split(".")
+                req_ms = int(datetime(int(y), int(m), int(d), tzinfo=timezone.utc).timestamp() * 1000)
+                if req_ms < int(reg_from_ms):
+                    out["issues"].append(
+                        {"severity": "high", "code": "REQUESTED_BEFORE_AVAILABLE",
+                         "message": (
+                            f"requested date_from {date_from} predates available data "
+                            f"start ({row.get('date_from_iso') or reg_from_ms})"
+                         )}
+                    )
+            except (ValueError, KeyError):
+                pass
+        if date_to and reg_to_ms:
+            try:
+                y, m, d = date_to.split(".")
+                req_ms = int(datetime(int(y), int(m), int(d), tzinfo=timezone.utc).timestamp() * 1000)
+                if req_ms > int(reg_to_ms):
+                    out["issues"].append(
+                        {"severity": "medium", "code": "REQUESTED_AFTER_AVAILABLE",
+                         "message": (
+                            f"requested date_to {date_to} extends past available data "
+                            f"end ({row.get('date_to_iso') or reg_to_ms}) — re-import "
+                            "or data_update first"
+                         )}
+                    )
+            except (ValueError, KeyError):
+                pass
+    out["ok"] = not out["issues"]
+    return out
 
 
 def register(mcp: FastMCP) -> None:
@@ -172,4 +309,79 @@ def register(mcp: FastMCP) -> None:
             text = await eng.call("-data action=timezones")
             return {"ok": True, "timezones": parse_list(text), "raw": text.strip()}
         except EngineError as exc:
+            return safe_error_payload(exc)
+
+    @mcp.tool(
+        description=(
+            "Verify that local data actually covers a requested backtest window. "
+            "Three-way cross-check: .dat file presence under history/, data.db DATA "
+            "table date range, and the requested window. Two modes: pass `project=` "
+            "to mine referenced symbols/dates from the project's .cfx, or pass "
+            "`symbol`/`timeframe`/`date_from`/`date_to` for an explicit one-off "
+            "check. Returns coverage findings per symbol with severity-tagged issues "
+            "(NO_LOCAL_DAT, NOT_IN_REGISTRY, REQUESTED_BEFORE_AVAILABLE, "
+            "REQUESTED_AFTER_AVAILABLE). Call BEFORE kicking off a Builder/Retester."
+        )
+    )
+    async def data_coverage_check(args: DataCoverageCheckArgs, ctx: Context) -> dict:
+        try:
+            eng = get_engine(ctx)
+            if not args.project and not args.symbol:
+                return {
+                    "ok": False,
+                    "error": "must supply either project or symbol",
+                }
+            reports: list[dict] = []
+            if args.project:
+                from sq_mcp.tools.projects import (
+                    _referenced_dates_from_cfx,
+                    _referenced_symbols_from_cfx,
+                )
+                cfx_path = eng.config.projects_dir / args.project / "project.cfx"
+                if not cfx_path.is_file():
+                    return {"ok": False, "error": f"project.cfx not found: {cfx_path}"}
+                referenced = sorted(_referenced_symbols_from_cfx(cfx_path))
+                dates = _referenced_dates_from_cfx(cfx_path)
+                df_list = dates.get("date_from") or []
+                dt_list = dates.get("date_to") or []
+                # Pick the strictest window from the task XMLs (use min date_from,
+                # max date_to) for coverage checks.
+                df = next((d for d in sorted(df_list) if "." in d), None)
+                dt = next(
+                    (d for d in sorted(dt_list, reverse=True) if "." in d), None
+                )
+                for sym in referenced:
+                    reports.append(
+                        _check_symbol_coverage(
+                            eng=eng,
+                            symbol=sym,
+                            timeframe=args.timeframe,
+                            date_from=df,
+                            date_to=dt,
+                        )
+                    )
+            else:
+                reports.append(
+                    _check_symbol_coverage(
+                        eng=eng,
+                        symbol=args.symbol,
+                        timeframe=args.timeframe,
+                        date_from=args.date_from,
+                        date_to=args.date_to,
+                    )
+                )
+            blocker_count = sum(
+                1 for r in reports for i in r["issues"] if i["severity"] == "high"
+            )
+            return {
+                "ok": blocker_count == 0,
+                "project": args.project,
+                "report_count": len(reports),
+                "blocker_count": blocker_count,
+                "warning_count": sum(
+                    1 for r in reports for i in r["issues"] if i["severity"] == "medium"
+                ),
+                "reports": reports,
+            }
+        except (EngineError, ValidationError) as exc:
             return safe_error_payload(exc)
