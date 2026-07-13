@@ -2433,8 +2433,7 @@ def register(mcp: FastMCP) -> None:
             t0 = time.time()
             text = await eng.call(f"-project action=loadconfig name={args.project} file={cfx}")
             steps.append({"step": "loadconfig", "elapsed": round(time.time() - t0, 2), "raw": text.strip()[:200]})
-            if "Error" in text:
-                return {"ok": False, "error": "loadconfig failed", "steps": steps}
+            loadconfig_failed = "Error" in text
 
             if args.sync_databanks:
                 for db in args.sync_databanks:
@@ -2460,11 +2459,17 @@ def register(mcp: FastMCP) -> None:
             steps.append({"step": "start", "elapsed": round(time.time() - t0, 2), "raw": text.strip()[:200]})
 
             failed = "Error" in text or "Nothing to" in text or "No strategies" in text
+            warning = None
+            if loadconfig_failed and not failed:
+                warning = "loadconfig reported an error, but start succeeded; SQX may reject direct loadconfig on live project.cfx while still allowing project start"
+            elif failed:
+                warning = "engine reported empty input — sync race likely; try larger sync_wait_seconds"
             return {
                 "ok": not failed,
                 "project": args.project,
                 "steps": steps,
-                "warning": "engine reported empty input — sync race likely; try larger sync_wait_seconds" if failed else None,
+                "warning": warning,
+                "loadconfig_ok": not loadconfig_failed,
             }
         except (EngineError, ValidationError) as exc:
             return safe_error_payload(exc)

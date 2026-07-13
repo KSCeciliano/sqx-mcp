@@ -641,8 +641,20 @@ def register(mcp: FastMCP) -> None:
                     ),
                 }
             r = parse_listing_response(text, "strategies")
+            fs_dbs = _scan_databanks_fs(project_dir)
+            if args.name:
+                fs_dbs = [d for d in fs_dbs if d["name"] == args.name]
+            fs_names = {d["name"] for d in fs_dbs}
             if r["ok"] and r["strategies"] and not is_status_only_response(text):
-                return r | {"source": "engine"}
+                parsed_names = [s for s in r["strategies"] if s in fs_names] if fs_names else []
+                if parsed_names:
+                    return {
+                        "ok": True,
+                        "strategies": parsed_names,
+                        "databanks_detail": fs_dbs,
+                        "source": "engine+filesystem",
+                        "engine_raw": r.get("raw"),
+                    }
             fs_dbs = _scan_databanks_fs(project_dir)
             if args.name:
                 fs_dbs = [d for d in fs_dbs if d["name"] == args.name]
