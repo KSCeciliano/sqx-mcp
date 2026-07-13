@@ -182,8 +182,7 @@ def _probability_of_drawdown(
 def _sqx_to_returns(sqx_path: Path) -> tuple[list[float], dict[str, Any]]:
     """Parse a .sqx, pull the embedded equity sparkline, convert to returns."""
     info = parse_sqx(sqx_path)
-    curves = info.get("equity_curves") if isinstance(info, dict) else None
-    curve = _select_curve(curves)
+    curve = _select_curve(info, "full")
     if not curve or len(curve) < 10:
         return [], {"ok": False, "error": "no usable equity curve in .sqx"}
     returns = _curve_to_returns(curve)
