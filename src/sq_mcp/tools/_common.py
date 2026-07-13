@@ -37,6 +37,7 @@ _ERR_PATTERNS = (
 _BOILERPLATE_PREFIXES: tuple[str, ...] = (
     "All tasks completed",
     "Synchronizing databanks",
+    "Syncing databank(s) from files",
     "Synchronization finished",
     "Bye",
     "Exit app",
@@ -59,8 +60,9 @@ _BOILERPLATE_PREFIXES: tuple[str, ...] = (
 # Match sqcli's "operation finished, output went to redirect file" markers
 # and timestamped header lines like "18:16:00 List of available databanks".
 _STATUS_ONLY_PATTERNS = (
-    re.compile(r"^\d{2}:\d{2}:\d{2}\s+List of"),
+    re.compile(r"^\d{2}:\d{2}:\d{2}\s+(List of|Number of)"),
     re.compile(r"\b(Data|Databanks|Strategies|Projects|Instruments|Symbols)\s+listed\.?\s*$"),
+    re.compile(r"\bDatabank count retrieved\.?\s*$"),
 )
 
 

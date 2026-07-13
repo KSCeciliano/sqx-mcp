@@ -31,6 +31,7 @@ from sq_mcp.engine import EngineClient, EngineError
 from sq_mcp.parsers import parse_cfx
 from sq_mcp.tools._common import (
     get_engine,
+    is_status_only_response,
     parse_list,
     parse_listing_response,
     parse_response,
@@ -1433,7 +1434,7 @@ def register(mcp: FastMCP) -> None:
                     "fallback_reason": f"engine error: {exc}",
                 }
             r = parse_listing_response(text, "projects")
-            if r["ok"] and r["projects"]:
+            if r["ok"] and r["projects"] and not is_status_only_response(text):
                 return r | {"source": "engine"}
             return {
                 "ok": True,
@@ -1441,7 +1442,11 @@ def register(mcp: FastMCP) -> None:
                 "projects_detail": fs_projects,
                 "source": "filesystem",
                 "fallback_reason": (
-                    "engine returned errors" if not r["ok"] else "engine returned empty list"
+                    "engine returned errors"
+                    if not r["ok"]
+                    else "engine returned status-only output"
+                    if is_status_only_response(text)
+                    else "engine returned empty list"
                 ),
                 "engine_errors": r.get("errors"),
                 "engine_raw": r.get("raw"),
@@ -1551,8 +1556,23 @@ def register(mcp: FastMCP) -> None:
         try:
             eng = get_engine(ctx)
             await ctx.warning(f"removing project {args.name!r} — irreversible")
+            project_dir = eng.config.projects_dir / args.name
             text = await eng.call(f"-project action=remove name={args.name}")
-            return parse_response(text) | {"project": args.name}
+            parsed = parse_response(text) | {"project": args.name}
+            if (
+                not parsed["ok"]
+                and "does not exist" in parsed.get("raw", "")
+                and project_dir.exists()
+            ):
+                shutil.rmtree(project_dir)
+                return {
+                    "ok": True,
+                    "project": args.name,
+                    "raw": parsed.get("raw", ""),
+                    "fallback": "engine did not know the project; removed directory from filesystem",
+                    "removed_from_disk": True,
+                }
+            return parsed
         except (EngineError, ValidationError) as exc:
             return safe_error_payload(exc)
 
