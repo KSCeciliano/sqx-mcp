@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,7 @@ class CfxTransactionArgs(BaseModel):
     project: str
     mutation_tool: str
     mutation_args: dict[str, Any]
+    rollback_on_success: bool = False
 
     @field_validator("project")
     @classmethod
@@ -153,11 +155,14 @@ def register(mcp: FastMCP) -> None:
                 "findings": [f.as_dict() for f in findings],
             }
             ok = bool(mutation.get("ok", True) and validation.get("ok") and not lint["has_critical"])
-            if not ok:
-                restore_project_snapshot(project_dir, snapshot)
+            rolled_back = not ok or args.rollback_on_success
+            if rolled_back:
+                tmp = cfx_path.with_suffix(".cfx.tmp")
+                shutil.copy2(snapshot, tmp)
+                os.replace(tmp, cfx_path)
             return {
                 "ok": ok,
-                "rolled_back": not ok,
+                "rolled_back": rolled_back,
                 "snapshot": str(snapshot),
                 "rollback_handle": str(snapshot),
                 "mutation": mutation,

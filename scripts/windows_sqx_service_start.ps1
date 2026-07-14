@@ -34,6 +34,7 @@ $env:SQX_POLICY_LEVEL = $PolicyLevel
 $env:SQX_MANAGED_SINGLETON = '1'
 $env:SQX_SINGLETON_LOCK = Join-Path $runtime 'sqx-mcp-managed.lock'
 $env:SQX_EVIDENCE_DIR = Join-Path $runtime 'evidence'
+$env:SQX_EVIDENCE_SCHEMA = 'C:\Users\Administrator\AppData\Local\hermes\hermes-os\schemas\evidence-envelope.schema.json'
 $proc = Start-Process -FilePath $python -ArgumentList '-m','sq_mcp' -WorkingDirectory $repo -RedirectStandardOutput $logFile -RedirectStandardError $errorLogFile -PassThru -WindowStyle Hidden
 Set-Content -Encoding ASCII $pidFile $proc.Id
 for ($i=0; $i -lt 120; $i++) {

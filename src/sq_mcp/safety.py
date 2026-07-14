@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 READ_ONLY_PREFIXES = (
     "health_", "environment_", "session_", "workspace_", "engine_status",
     "engine_log", "project_list", "project_status", "project_inspect", "project_precheck",
@@ -26,8 +28,8 @@ READ_ONLY_PREFIXES = (
     "tools_catalog", "common_workflows", "broker_registry", "data_timezones", "history_",
 )
 SCRATCH_WRITE_PREFIXES = ("cfx_set_", "cfx_toggle_", "cfx_configure_", "cfx_template_")
+SCRATCH_WRITE_TOOLS = {"project_snapshot", "project_restore_snapshot", "cfx_transaction"}
 MANAGED_WRITE_TOOLS = {
-    "project_snapshot", "project_restore_snapshot", "cfx_transaction",
     "databank_force_sync", "databank_save", "databank_load", "project_config",
 }
 ADMIN_TOOLS = {
@@ -68,7 +70,7 @@ def classify_tool(name: str) -> str:
         return "admin-approved"
     if name in MANAGED_WRITE_TOOLS:
         return "managed-write"
-    if name.startswith(SCRATCH_WRITE_PREFIXES):
+    if name in SCRATCH_WRITE_TOOLS or name.startswith(SCRATCH_WRITE_PREFIXES):
         return "scratch-write"
     if name.startswith(READ_ONLY_PREFIXES):
         return "read-only"
@@ -171,14 +173,26 @@ class ApprovalAuthority:
 
 
 class EvidenceFactory:
-    def __init__(self, *, profile: str = "sqx-specialist", evidence_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        profile: str = "sqx-specialist",
+        evidence_dir: Path | None = None,
+        schema_path: Path | None = None,
+    ) -> None:
         self.profile = profile
         self.evidence_dir = evidence_dir
+        configured = os.getenv("SQX_EVIDENCE_SCHEMA")
+        self.schema_path = schema_path or (Path(configured) if configured else None)
+        self._validator: Draft202012Validator | None = None
+        if self.schema_path:
+            schema = json.loads(self.schema_path.read_text(encoding="utf-8"))
+            self._validator = Draft202012Validator(schema)
 
-    def build(self, *, tool: str, sanitized_inputs: dict[str, Any], result: dict[str, Any], before_state: dict[str, Any] | None, approval: dict[str, Any] | None, rollback_handle: Any) -> dict[str, Any]:
+    def _make_envelope(self, *, tool: str, sanitized_inputs: dict[str, Any], result: dict[str, Any], before_state: dict[str, Any] | None, approval: dict[str, Any] | None, rollback_handle: Any) -> dict[str, Any]:
         ok = bool(result.get("ok", True))
         result_snapshot = json.loads(json.dumps(result, default=str))
-        envelope = {
+        return {
             "initiative_id": None, "task_id": None, "session_id": None,
             "board": "sqx", "profile": self.profile, "specialist": "sqx-specialist",
             "tool_calls": [{"tool": tool, "ok": ok}], "sanitized_inputs": sanitized_inputs,
@@ -188,11 +202,25 @@ class EvidenceFactory:
             "rollback_handle": rollback_handle, "final_status": "PASS" if ok else "FAIL_BLOCKED",
             "residual_risks": [], "deep_links": [], "created_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def build(self, *, tool: str, sanitized_inputs: dict[str, Any], result: dict[str, Any], before_state: dict[str, Any] | None, approval: dict[str, Any] | None, rollback_handle: Any) -> dict[str, Any]:
+        envelope = self._make_envelope(
+            tool=tool,
+            sanitized_inputs=sanitized_inputs,
+            result=result,
+            before_state=before_state,
+            approval=approval,
+            rollback_handle=rollback_handle,
+        )
+        if self._validator:
+            self._validator.validate(envelope)
         if self.evidence_dir:
             self.evidence_dir.mkdir(parents=True, exist_ok=True)
             path = self.evidence_dir / f"{int(time.time()*1000)}-{tool}.json"
-            path.write_text(json.dumps(envelope, indent=2, default=str), encoding="utf-8")
             envelope["artifacts"].append(str(path))
+            if self._validator:
+                self._validator.validate(envelope)
+            path.write_text(json.dumps(envelope, indent=2, default=str), encoding="utf-8")
         return envelope
 
 

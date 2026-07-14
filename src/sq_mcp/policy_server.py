@@ -29,12 +29,17 @@ def install_policy_interceptor(mcp: Any) -> None:
             metadata.setdefault("client_id", str(context.client_id or "anonymous"))
 
         async def operation() -> dict[str, Any]:
-            result = await original(name, arguments, context=context, convert_result=convert_result)
+            result = await original(name, arguments, context=context, convert_result=False)
             if isinstance(result, dict):
                 return result
             return {"ok": True, "result": result}
 
-        return await get_controller().execute(name, arguments, metadata, operation)
+        governed = await get_controller().execute(name, arguments, metadata, operation)
+        if convert_result:
+            tool = manager.get_tool(name)
+            if tool is not None:
+                return tool.fn_metadata.convert_result(governed)
+        return governed
 
     manager.call_tool = guarded_call_tool
     manager._sqx_policy_installed = True
