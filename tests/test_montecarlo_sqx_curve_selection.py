@@ -2,7 +2,6 @@ from pathlib import Path
 
 from sq_mcp.tools.montecarlo import _sqx_to_returns
 
-
 REAL_SQX_CANDIDATES = [
     Path(r"C:/SQX_144_Full/user/projects/Retester/databanks/phase2_samples/NDX_M5_UP_60_ST_136_MT5Strategy 1.10.166.sqx"),
     Path(r"/mnt/c/SQX_144_Full/user/projects/Retester/databanks/phase2_samples/NDX_M5_UP_60_ST_136_MT5Strategy 1.10.166.sqx"),

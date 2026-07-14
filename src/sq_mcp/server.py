@@ -8,14 +8,18 @@ Stdio transport: stdout is reserved for JSON-RPC, all logs MUST go to stderr.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from sq_mcp.config import detect_config
 from sq_mcp.engine import EngineClient
+from sq_mcp.policy_server import install_policy_interceptor
+from sq_mcp.singleton import ManagedEnginePool, SingletonLock
 from sq_mcp.tools import (
     advisor,
     alerts,
@@ -96,6 +100,7 @@ from sq_mcp.tools import (
     risk_profiles,
     robustness,
     rolling_metrics,
+    safety_control,
     schedule,
     sensitivity,
     ship_pipeline,
@@ -134,12 +139,34 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("sq_mcp")
+_MANAGED_POOL: ManagedEnginePool | None = None
+_MANAGED_SINGLETON: SingletonLock | None = None
+
+
+async def _managed_engine() -> EngineClient:
+    global _MANAGED_POOL, _MANAGED_SINGLETON
+    config = detect_config()
+    if _MANAGED_SINGLETON is None:
+        lock_path = Path(
+            os.getenv(
+                "SQX_SINGLETON_LOCK",
+                str(config.sqx_home / "user" / "sqx-mcp-managed.lock"),
+            )
+        )
+        _MANAGED_SINGLETON = SingletonLock(lock_path)
+        _MANAGED_SINGLETON.acquire()
+    if _MANAGED_POOL is None:
+        _MANAGED_POOL = ManagedEnginePool(lambda: EngineClient(config))
+    return await _MANAGED_POOL.acquire()
 
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP) -> AsyncIterator[EngineClient]:
     """Boot SQ X engine once, share the EngineClient with every tool call."""
     config = detect_config()
+    if os.getenv("SQX_MANAGED_SINGLETON", "0") == "1":
+        yield await _managed_engine()
+        return
     log.info("SQ X home: %s (valid=%s)", config.sqx_home, config.is_valid)
     if not config.is_valid:
         log.warning(
@@ -268,6 +295,7 @@ stationary_bootstrap.register(mcp)
 wf_matrix.register(mcp)
 spa_test.register(mcp)
 system_perm.register(mcp)
+safety_control.register(mcp)
 vol_estimators.register(mcp)
 bar_construction.register(mcp)
 mean_reversion.register(mcp)
@@ -284,10 +312,38 @@ signal_quality.register(mcp)
 indicator_bands.register(mcp)
 oscillators.register(mcp)
 
+install_policy_interceptor(mcp)
+
+
+def _shutdown_managed() -> None:
+    global _MANAGED_POOL, _MANAGED_SINGLETON
+    if _MANAGED_POOL is not None:
+        import asyncio
+
+        asyncio.run(_MANAGED_POOL.shutdown())
+        _MANAGED_POOL = None
+    if _MANAGED_SINGLETON is not None:
+        _MANAGED_SINGLETON.release()
+        _MANAGED_SINGLETON = None
+
 
 def main() -> None:
     """Entry point used by the `sq-mcp` console script."""
-    mcp.run()
+    transport = os.getenv("SQX_MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.settings.host = os.getenv("SQX_MCP_HOST", "127.0.0.1")
+        mcp.settings.port = int(os.getenv("SQX_MCP_PORT", "8765"))
+        mcp.settings.streamable_http_path = os.getenv("SQX_MCP_PATH", "/mcp")
+    try:
+        if transport == "streamable-http":
+            mcp.run(transport="streamable-http")
+        elif transport == "sse":
+            mcp.run(transport="sse")
+        else:
+            mcp.run(transport="stdio")
+    finally:
+        if os.getenv("SQX_MANAGED_SINGLETON", "0") == "1":
+            _shutdown_managed()
 
 
 if __name__ == "__main__":
