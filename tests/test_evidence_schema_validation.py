@@ -6,7 +6,11 @@ from jsonschema import ValidationError
 
 from sq_mcp.safety import EvidenceFactory
 
-SCHEMA = Path("/mnt/c/Users/Administrator/AppData/Local/hermes/hermes-os/schemas/evidence-envelope.schema.json")
+SCHEMA_CANDIDATES = (
+    Path("/mnt/c/Users/Administrator/AppData/Local/hermes/hermes-os/schemas/evidence-envelope.schema.json"),
+    Path(r"C:\Users\Administrator\AppData\Local\hermes\hermes-os\schemas\evidence-envelope.schema.json"),
+)
+SCHEMA = next((path for path in SCHEMA_CANDIDATES if path.is_file()), SCHEMA_CANDIDATES[0])
 
 
 def test_persisted_evidence_is_validated_against_runtime_schema(tmp_path):
