@@ -159,7 +159,7 @@ def _alpha_beta(
     b_mean = _mean(b)
     cov = sum((s[i] - s_mean) * (b[i] - b_mean) for i in range(n)) / max(1, n - 1)
     var_b = sum((bi - b_mean) ** 2 for bi in b) / max(1, n - 1)
-    if var_b == 0:
+    if var_b <= 1e-12:
         return {"alpha": None, "beta": None, "note": "benchmark variance is zero"}
     beta = cov / var_b
     alpha = s_mean - beta * b_mean

@@ -96,7 +96,7 @@ def _sharpe(args: ReturnSeriesArgs) -> dict[str, Any]:
     excess = [r - rf_per_period for r in args.returns]
     mean_excess = _mean(excess)
     std_excess = _std(excess)
-    if std_excess == 0:
+    if std_excess <= 1e-12:
         return {"sharpe": None, "note": "std is zero — no signal"}
     sharpe_period = safe_div(mean_excess, std_excess)
     if sharpe_period is None:

@@ -111,7 +111,7 @@ Claude: Started. After 6 minutes: 87 strategies, growth flat for the last
 - **Export .sqx to .mq5.** GUI-only in Build 143. The CLI doesn't expose the MQL5 codegen. You still have to click "Export to MT5" yourself when you want to take a strategy live.
 - **Edit strategy logic.** .sqx files are partially compiled binaries. You can read the rules, change SL/PT or date ranges, retarget the symbol, but you can't rewrite the entry/exit logic from outside.
 - **Create new brokers.** The H2 database holding broker metadata is locked while the engine is running. The forex/general registry actually lives in a SQLite file that I can read without locking, but writes still need the GUI.
-- **Windows or macOS.** I run this on Fedora 43. The platform-dependent bits (sqcli executable name, process flags, install path detection) are coded for cross-platform, but nobody's verified it end-to-end on Windows yet.
+- **Windows support is validated primarily against SQX 144 Full.** The current best-validated target is SQX 144 on Windows-native deployment. SQX 141 appears practical with caveats. SQX 136 is not currently a practical support target without extra engine-compatibility work.
 
 ## Install
 

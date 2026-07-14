@@ -67,7 +67,7 @@ def _rolling_sharpe(
         win = series[t - window + 1 : t + 1]
         m = sum(win) / window
         var = sum((x - m) ** 2 for x in win) / (window - 1)
-        if var <= 0:
+        if var <= 1e-12:
             out.append(None)
             continue
         s = math.sqrt(var)
